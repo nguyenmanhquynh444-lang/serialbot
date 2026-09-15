@@ -68,9 +68,10 @@ cài, kiểm cấu hình kho, chạy thử một mã, tới xử lý các sự c
 một nội dung:
 
 - **Trang web** (dễ đọc trên điện thoại, gửi bằng link):
-  https://claude.ai/code/artifact/f34273cd-bc7e-4bae-b577-af0d1bba0de4
+  https://claude.ai/artifact/DpEZWGygmtP8BgYa8UNHoY
   Nguồn là [`huong-dan-cai-dat.html`](huong-dan-cai-dat.html) — sửa file đó rồi publish
-  lại là trang tự cập nhật, link giữ nguyên.
+  lại là trang tự cập nhật, link giữ nguyên. Link này ở chế độ riêng tư mặc định —
+  vào trang, bấm nút Share, chọn "Anyone with the link" thì client mới xem được.
 - **File markdown**: [`HUONG-DAN-CAI-DAT.md`](HUONG-DAN-CAI-DAT.md)
 
 Sửa nội dung thì nhớ sửa **cả hai** cho khỏi lệch.
