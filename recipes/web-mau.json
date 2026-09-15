@@ -1,0 +1,61 @@
+{
+  "name": "Web - mẫu (sửa selector trước khi chạy)",
+  "version": 1,
+  "steps": [
+    {
+      "type": "web_fill",
+      "params": {
+        "selector": "#serial",
+        "value": "{serial}",
+        "timeout": 15.0
+      },
+      "on_fail": "error"
+    },
+    {
+      "type": "web_click",
+      "params": {
+        "selector": "",
+        "text": "Tìm",
+        "timeout": 15.0
+      },
+      "on_fail": "error"
+    },
+    {
+      "type": "web_wait",
+      "params": {
+        "selector": "#ket-qua",
+        "state": "visible",
+        "timeout": 15.0
+      },
+      "on_fail": "error"
+    },
+    {
+      "type": "check",
+      "params": {
+        "success_keywords": "",
+        "error_keywords": "loi,that bai,khong hop le",
+        "not_found_keywords": "khong tim thay,not found,khong ton tai",
+        "dismiss_dialog": true
+      },
+      "on_fail": "continue"
+    },
+    {
+      "type": "web_read",
+      "params": {
+        "selector": "#ket-qua",
+        "text": "",
+        "var_name": "ketqua",
+        "timeout": 15.0
+      },
+      "on_fail": "continue"
+    },
+    {
+      "type": "write_cell",
+      "params": {
+        "column": "J",
+        "value": "{var:ketqua}"
+      },
+      "on_fail": "continue"
+    }
+  ]
+}

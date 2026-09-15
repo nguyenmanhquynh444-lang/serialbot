@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<!--
+  Trang giả lập màn hình quét serial của hệ thống kho, dựng riêng để test đường
+  chạy trên trình duyệt mà KHÔNG đụng vào hệ thống thật.
+
+  Mỗi chi tiết ở đây là một kiểu bấm trượt có thật:
+   - nút "Tìm" bọc chữ trong <span>: node có chữ không phải node bấm được
+   - nút "Lưu" nằm dưới cuối trang: phải cuộn tới mới bấm được
+   - nút "Đồng ý" của hộp thoại bị một lớp phủ trong suốt che: bấm thường trượt
+   - nút "Xuất file" bật lên muộn 400ms: bấm ngay là bấm vào nút còn disabled
+-->
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <title>Kho - Quét serial</title>
+  <style>
+    body { font-family: sans-serif; margin: 24px; }
+    #ket-qua { margin-top: 16px; font-size: 18px; }
+    #vung-duoi { margin-top: 1400px; }
+    .lop-phu {
+      position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 10;
+    }
+    #hop-thoai {
+      position: fixed; left: 20%; top: 25%; width: 60%; z-index: 5;
+      background: #fff; border: 1px solid #888; padding: 20px;
+    }
+    .an { display: none; }
+  </style>
+</head>
+<body>
+  <h1>Quét serial</h1>
+
+  <label for="serial">Serial</label>
+  <input id="serial" name="serial" type="text" placeholder="Quét hoặc nhập serial">
+
+  <button id="btn-tim" type="button"><span>Tìm</span></button>
+
+  <select id="kho" name="kho">
+    <option value="hn">Kho Hà Nội</option>
+    <option value="hcm">Kho Hồ Chí Minh</option>
+  </select>
+
+  <button id="btn-xuat" type="button" disabled>Xuất file</button>
+
+  <div id="ket-qua"></div>
+
+  <div id="vung-duoi">
+    <button id="btn-luu" type="button">Lưu phiên</button>
+    <div id="trang-thai-luu"></div>
+  </div>
+
+  <!-- Hộp thoại lỗi: nằm trong DOM sẵn, chỉ ẩn/hiện, đúng như các app web thật -->
+  <div id="lop-phu" class="lop-phu an"></div>
+  <div id="hop-thoai" class="an">
+    <h3>Lỗi</h3>
+    <p id="hop-thoai-noi-dung">Không tìm thấy serial trong hệ thống</p>
+    <p id="hop-thoai-chi-tiet">Mã vừa quét: - | Tài khoản: kho01</p>
+    <button id="btn-dong-y" type="button">Đồng ý</button>
+  </div>
+
+  <script>
+    // Serial hợp lệ: chuỗi bắt đầu bằng OK. Còn lại coi như không có trong kho.
+    var input = document.getElementById('serial');
+    var ketQua = document.getElementById('ket-qua');
+    var hopThoai = document.getElementById('hop-thoai');
+    var lopPhu = document.getElementById('lop-phu');
+
+    function tim() {
+      var serial = (input.value || '').trim();
+      if (serial.toUpperCase().indexOf('OK') === 0) {
+        ketQua.textContent = 'Thành công: đã ghi nhận ' + serial;
+        hopThoai.classList.add('an');
+        lopPhu.classList.add('an');
+        // Nút này chỉ bật lên sau khi có kết quả, và bật muộn.
+        setTimeout(function () {
+          document.getElementById('btn-xuat').disabled = false;
+        }, 400);
+      } else {
+        ketQua.textContent = '';
+        document.getElementById('hop-thoai-chi-tiet').textContent =
+          'Mã vừa quét: ' + serial + ' | Tài khoản: kho01';
+        hopThoai.classList.remove('an');
+        lopPhu.classList.remove('an');
+      }
+    }
+
+    document.getElementById('btn-tim').addEventListener('click', tim);
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') tim();
+    });
+
+    document.getElementById('btn-dong-y').addEventListener('click', function () {
+      hopThoai.classList.add('an');
+      lopPhu.classList.add('an');
+      ketQua.textContent = 'Đã đóng thông báo';
+    });
+
+    document.getElementById('btn-luu').addEventListener('click', function () {
+      document.getElementById('trang-thai-luu').textContent = 'Đã lưu phiên';
+    });
+
+    document.getElementById('btn-xuat').addEventListener('click', function () {
+      ketQua.textContent = 'Đã xuất file';
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+PyQt6>=6.5
+openpyxl>=3.1
+pyautogui>=0.9
+pygetwindow>=0.0.9
+playwright>=1.40

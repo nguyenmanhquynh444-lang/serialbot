@@ -1,0 +1,40 @@
+{
+  "name": "Classic",
+  "version": 1,
+  "steps": [
+    {
+      "type": "clear_field",
+      "params": {},
+      "on_fail": "error"
+    },
+    {
+      "type": "type",
+      "params": {
+        "text": "{serial}"
+      },
+      "on_fail": "error"
+    },
+    {
+      "type": "key",
+      "params": {
+        "key": "enter"
+      },
+      "on_fail": "error"
+    },
+    {
+      "type": "wait",
+      "params": {
+        "seconds": 0.2
+      },
+      "on_fail": "continue"
+    },
+    {
+      "type": "check",
+      "params": {
+        "success_keywords": "",
+        "error_keywords": "error,invalid,loi,khong hop le"
+      },
+      "on_fail": "continue"
+    }
+  ]
+}

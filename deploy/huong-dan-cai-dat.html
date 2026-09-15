@@ -1,0 +1,442 @@
+<title>Cài Serial Paste Bot</title>
+
+<style>
+  :root{
+    --ground:#F5F7F6; --surface:#FFFFFF; --surface-2:#EDF1EF;
+    --ink:#141C1B; --ink-soft:#55615D; --ink-faint:#8A9692;
+    --rule:#DBE2DF; --rule-soft:#E9EEEC;
+    --accent:#0D6B62; --accent-ink:#0A544D; --accent-soft:#E1EFEC;
+    --on-accent:#FFFFFF;
+    --warn:#8F4E06; --warn-soft:#FAF0DE;
+    --shadow:0 1px 2px rgba(20,28,27,.05), 0 10px 28px -16px rgba(20,28,27,.22);
+    --serif:Cambria,"Times New Roman",Times,serif;
+    --sans:"Segoe UI",-apple-system,BlinkMacSystemFont,Roboto,"Helvetica Neue",Arial,sans-serif;
+    --mono:"Cascadia Mono",Consolas,"SF Mono",Menlo,"Roboto Mono",monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#0E1312; --surface:#161D1B; --surface-2:#1C2523;
+      --ink:#E4ECE9; --ink-soft:#9AA8A4; --ink-faint:#6F7E7A;
+      --rule:#26312E; --rule-soft:#1E2725;
+      --accent:#4FC0B1; --accent-ink:#7ED6C9; --accent-soft:#122A27;
+      --on-accent:#0B1615;
+      --warn:#DFA45E; --warn-soft:#231A10;
+      --shadow:0 1px 2px rgba(0,0,0,.45), 0 10px 28px -16px rgba(0,0,0,.7);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#0E1312; --surface:#161D1B; --surface-2:#1C2523;
+    --ink:#E4ECE9; --ink-soft:#9AA8A4; --ink-faint:#6F7E7A;
+    --rule:#26312E; --rule-soft:#1E2725;
+    --accent:#4FC0B1; --accent-ink:#7ED6C9; --accent-soft:#122A27;
+    --on-accent:#0B1615;
+    --warn:#DFA45E; --warn-soft:#231A10;
+    --shadow:0 1px 2px rgba(0,0,0,.45), 0 10px 28px -16px rgba(0,0,0,.7);
+  }
+
+  body{
+    background:var(--ground); color:var(--ink);
+    font-family:var(--sans); font-size:17px; line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:44rem; margin:0 auto; padding:3.5rem 1.35rem 6rem;}
+  p,li{max-width:66ch;}
+  a{color:var(--accent-ink); text-decoration-thickness:1px; text-underline-offset:2px;}
+  a:focus-visible,summary:focus-visible{outline:2px solid var(--accent); outline-offset:3px; border-radius:2px;}
+  code{
+    font-family:var(--mono); font-size:.87em; background:var(--surface-2);
+    padding:.12em .38em; border-radius:3px; color:var(--ink); word-break:break-word;
+  }
+  strong{font-weight:650;}
+  em{font-style:italic;}
+
+  .masthead{border-bottom:2px solid var(--ink); padding-bottom:1.6rem; margin-bottom:2.75rem;}
+  .kicker{
+    font-family:var(--mono); font-size:.7rem; letter-spacing:.16em; text-transform:uppercase;
+    color:var(--accent); margin-bottom:.9rem;
+  }
+  h1{
+    font-family:var(--serif); font-weight:600; font-size:clamp(2.1rem,6vw,2.9rem);
+    line-height:1.12; letter-spacing:-.015em; text-wrap:balance; margin-bottom:.7rem;
+  }
+  .standfirst{font-size:1.06rem; color:var(--ink-soft); max-width:54ch;}
+
+  nav.toc{
+    background:var(--surface); border:1px solid var(--rule); border-radius:6px;
+    padding:1.1rem 1.3rem; margin-bottom:3rem; box-shadow:var(--shadow);
+  }
+  nav.toc h2{
+    font-family:var(--mono); font-size:.68rem; letter-spacing:.15em; text-transform:uppercase;
+    color:var(--ink-faint); margin-bottom:.75rem; font-weight:600;
+  }
+  nav.toc ol{list-style:none; display:grid; gap:.42rem;}
+  nav.toc li{display:flex; gap:.7rem; align-items:baseline; max-width:none;}
+  nav.toc .n{font-family:var(--mono); font-size:.78rem; color:var(--ink-faint); min-width:1.4rem;}
+  nav.toc a{text-decoration:none; color:var(--ink);}
+  nav.toc a:hover{color:var(--accent-ink); text-decoration:underline;}
+
+  section{margin-bottom:3.25rem;}
+  .shead{display:flex; gap:.85rem; align-items:baseline; margin-bottom:1.1rem;}
+  .snum{
+    font-family:var(--mono); font-size:.82rem; font-weight:600; color:var(--accent);
+    font-variant-numeric:tabular-nums;
+  }
+  h2{
+    font-family:var(--serif); font-weight:600; font-size:1.65rem; line-height:1.2;
+    letter-spacing:-.01em; text-wrap:balance;
+  }
+  h3{font-size:1.02rem; font-weight:650; margin:1.85rem 0 .6rem; letter-spacing:-.005em;}
+  section > p + p{margin-top:.85rem;}
+
+  ol.steps{list-style:none; counter-reset:s; display:grid; gap:.85rem; margin:1rem 0;}
+  ol.steps > li{counter-increment:s; display:flex; gap:.8rem; align-items:flex-start;}
+  ol.steps > li::before{
+    content:counter(s); font-family:var(--mono); font-size:.72rem; font-weight:600;
+    color:var(--accent); background:var(--accent-soft);
+    min-width:1.55rem; height:1.55rem; border-radius:50%;
+    display:flex; align-items:center; justify-content:center; flex-shrink:0; margin-top:.18rem;
+  }
+
+  .check{display:grid; gap:0; margin:1.2rem 0 1rem; border-top:1px solid var(--rule);}
+  .check .row{
+    display:grid; grid-template-columns:1.5rem 1fr; gap:.85rem;
+    padding:.85rem .2rem; border-bottom:1px solid var(--rule-soft); align-items:start;
+  }
+  .box{width:1.05rem; height:1.05rem; border:1.5px solid var(--accent); border-radius:3px; margin-top:.32rem;}
+  .check .what{font-weight:600;}
+  .check .how{color:var(--ink-soft); font-size:.93rem; margin-top:.1rem; max-width:none;}
+
+  .methods{display:grid; gap:1rem; margin:1.3rem 0;}
+  .card{
+    background:var(--surface); border:1px solid var(--rule); border-radius:6px;
+    padding:1.25rem 1.35rem; box-shadow:var(--shadow);
+  }
+  .card.primary{border-color:var(--accent); border-width:1.5px;}
+  .card-top{display:flex; flex-wrap:wrap; gap:.6rem; align-items:baseline; margin-bottom:.55rem;}
+  .card h3{margin:0; font-size:1.08rem;}
+  .tag{
+    font-family:var(--mono); font-size:.63rem; letter-spacing:.11em; text-transform:uppercase;
+    font-weight:600; padding:.24em .6em; border-radius:3px;
+    background:var(--accent-soft); color:var(--accent-ink);
+  }
+  .tag.quiet{background:var(--surface-2); color:var(--ink-faint);}
+  .card p{font-size:.96rem; color:var(--ink-soft); max-width:none;}
+  .card ol.steps{margin:.85rem 0 0;}
+  .card ol.steps > li{font-size:.96rem;}
+  .tradeoff{
+    margin-top:.9rem; padding-top:.85rem; border-top:1px solid var(--rule-soft);
+    font-size:.9rem; color:var(--ink-soft); max-width:none;
+  }
+
+  .dl{
+    display:inline-flex; align-items:center; gap:.6rem; margin:.9rem 0 .2rem;
+    background:var(--accent); color:var(--on-accent); text-decoration:none;
+    font-weight:600; font-size:.97rem; padding:.7rem 1.15rem; border-radius:5px;
+    transition:transform .12s ease, filter .12s ease;
+  }
+  .dl:hover{filter:brightness(1.08); transform:translateY(-1px);}
+  .dl .arrow{font-family:var(--mono); opacity:.8;}
+
+  .note{
+    border-left:3px solid var(--accent); background:var(--accent-soft);
+    padding:.95rem 1.15rem; border-radius:0 5px 5px 0; margin:1.2rem 0;
+  }
+  .note.warn{border-left-color:var(--warn); background:var(--warn-soft);}
+  .note p{max-width:none; font-size:.96rem;}
+  .note .label{
+    font-family:var(--mono); font-size:.66rem; letter-spacing:.13em; text-transform:uppercase;
+    font-weight:600; color:var(--accent-ink); display:block; margin-bottom:.35rem;
+  }
+  .note.warn .label{color:var(--warn);}
+
+  .scroll{overflow-x:auto; margin:1.2rem 0; -webkit-overflow-scrolling:touch;}
+  table{border-collapse:collapse; width:100%; font-size:.94rem; min-width:24rem;}
+  th,td{text-align:left; padding:.7rem .8rem; border-bottom:1px solid var(--rule-soft); vertical-align:top;}
+  th{
+    font-family:var(--mono); font-size:.68rem; letter-spacing:.11em; text-transform:uppercase;
+    color:var(--ink-faint); font-weight:600; border-bottom:1px solid var(--rule); white-space:nowrap;
+  }
+  td:first-child{font-weight:600; white-space:nowrap;}
+
+  pre{
+    background:var(--surface-2); border:1px solid var(--rule); border-radius:5px;
+    padding:.85rem 1rem; overflow-x:auto; margin:1rem 0;
+    font-family:var(--mono); font-size:.85rem; line-height:1.5;
+  }
+  pre code{background:none; padding:0; white-space:pre;}
+
+  .fix{border-top:1px solid var(--rule); margin-top:1.3rem;}
+  .fix details{border-bottom:1px solid var(--rule-soft);}
+  .fix summary{
+    cursor:pointer; padding:.95rem .2rem; font-weight:600; list-style:none;
+    display:flex; gap:.75rem; align-items:baseline;
+  }
+  .fix summary::-webkit-details-marker{display:none;}
+  .fix summary::before{content:"+"; font-family:var(--mono); color:var(--accent); font-weight:700; flex-shrink:0;}
+  .fix details[open] summary::before{content:"\2212";}
+  .fix summary:hover{color:var(--accent-ink);}
+  .fix .body{padding:0 .2rem 1.15rem 1.65rem;}
+  .fix .body p, .fix .body li{font-size:.96rem;}
+
+  footer{
+    margin-top:4rem; padding-top:1.5rem; border-top:1px solid var(--rule);
+    font-size:.9rem; color:var(--ink-faint);
+  }
+  footer p{max-width:none;}
+
+  @media (prefers-reduced-motion:reduce){ *{transition:none !important;} }
+  @media (max-width:34rem){
+    body{font-size:16px;}
+    .wrap{padding:2.5rem 1.1rem 4rem;}
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="kicker">Serial Paste Bot &middot; phi&ecirc;n b&#7843;n 2.1.0</div>
+    <h1>Cài đặt trên máy mới</h1>
+    <p class="standfirst">Từ khâu chuẩn bị LDPlayer tới lúc chạy trọn mã đầu tiên. Máy đã có bot rồi thì chỉ cần bấm <code>Cap-nhat.bat</code> — bỏ qua toàn bộ phần cài đặt.</p>
+  </header>
+
+  <nav class="toc">
+    <h2>Nội dung</h2>
+    <ol>
+      <li><span class="n">00</span><a href="#chuanbi">Kiểm tra trước khi bắt đầu</a></li>
+      <li><span class="n">01</span><a href="#caidat">Cài đặt — chọn một trong ba cách</a></li>
+      <li><span class="n">02</span><a href="#smartscreen">Khi Windows chặn lần đầu</a></li>
+      <li><span class="n">03</span><a href="#landau">Mở app lần đầu</a></li>
+      <li><span class="n">04</span><a href="#chaythu">Chạy thử một mã</a></li>
+      <li><span class="n">05</span><a href="#capnhat">Cập nhật về sau</a></li>
+      <li><span class="n">06</span><a href="#go">Gỡ cài đặt</a></li>
+      <li><span class="n">07</span><a href="#suco">Sự cố thường gặp</a></li>
+    </ol>
+  </nav>
+
+  <section id="chuanbi">
+    <div class="shead"><span class="snum">00</span><h2>Kiểm tra trước khi bắt đầu</h2></div>
+    <p>Thiếu một trong bốn thứ này thì cài xong bot cũng không chạy được việc gì.</p>
+
+    <div class="check">
+      <div class="row">
+        <div class="box"></div>
+        <div>
+          <div class="what">Windows 10 trở lên, bản 64-bit</div>
+          <div class="how">Chuột phải <em>This PC</em> → <em>Properties</em> → xem dòng <em>System type</em>.</div>
+        </div>
+      </div>
+      <div class="row">
+        <div class="box"></div>
+        <div>
+          <div class="what">LDPlayer đã cài</div>
+          <div class="how">Mở thử LDPlayer, phải lên được màn hình Android.</div>
+        </div>
+      </div>
+      <div class="row">
+        <div class="box"></div>
+        <div>
+          <div class="what">App kho đã đăng nhập sẵn trong LDPlayer</div>
+          <div class="how">Mở app kho trong máy ảo, phải vào thẳng màn hình chính, không hỏi đăng nhập.</div>
+        </div>
+      </div>
+      <div class="row">
+        <div class="box"></div>
+        <div>
+          <div class="what">File Excel đơn hàng</div>
+          <div class="how">Chép sẵn vào máy, ví dụ để ở Desktop.</div>
+        </div>
+      </div>
+    </div>
+
+    <p>Bot <strong>không tự cài LDPlayer</strong> và <strong>không tự đăng nhập</strong> app kho. Hai việc đó làm trước.</p>
+
+    <div class="note">
+      <span class="label">Không cần cài Python</span>
+      <p>Nếu ai đó bảo bạn chạy <code>python main.py</code> thì họ đưa nhầm mã nguồn — bản cài đã có sẵn Python bên trong. Gặp lỗi <code>Python was not found</code> là dấu hiệu của việc chép nhầm thư mục.</p>
+    </div>
+  </section>
+
+  <section id="caidat">
+    <div class="shead"><span class="snum">01</span><h2>Cài đặt</h2></div>
+    <p>Chọn <strong>một</strong> trong ba cách dưới đây. Cách A tiện nhất vì về sau cập nhật cũng dùng lại đúng file đó.</p>
+
+    <div class="methods">
+
+      <article class="card primary">
+        <div class="card-top">
+          <h3>Cách A — dùng <code>Cap-nhat.bat</code></h3>
+          <span class="tag">Khuyên dùng</span>
+        </div>
+        <p>Một file duy nhất, dùng được cho cả cài mới lẫn cập nhật về sau.</p>
+        <ol class="steps">
+          <li>Xin file <code>Cap-nhat.bat</code> từ người phát hành, để ngoài <strong>Desktop</strong>.</li>
+          <li>Double-click vào nó.</li>
+          <li>Cửa sổ đen hiện ra, chờ khoảng một phút. Nó tự tải bộ cài rồi tự cài, không hỏi gì.</li>
+          <li>Cài xong app tự mở.</li>
+        </ol>
+        <p class="tradeoff">Sau này ra bản mới, bấm lại đúng file đó là xong — không phải xin file mới.</p>
+      </article>
+
+      <article class="card">
+        <div class="card-top">
+          <h3>Cách B — tải tay từ GitHub</h3>
+          <span class="tag quiet">Khi bat bị chặn</span>
+        </div>
+        <p>Dùng khi <code>Cap-nhat.bat</code> báo lỗi tải: mạng công ty chặn, phần mềm diệt virus chặn…</p>
+        <a class="dl" href="https://github.com/nguyenmanhquynh444-lang/serialbot/releases/latest">Mở trang tải <span class="arrow">-&gt;</span></a>
+        <ol class="steps">
+          <li>Ở mục <strong>Assets</strong>, tải file <code>SerialPasteBot-Setup.exe</code> (~40 MB).</li>
+          <li>Chạy file vừa tải → <strong>Tiếp tục</strong> → <strong>Cài đặt</strong> → <strong>Hoàn tất</strong>.</li>
+        </ol>
+        <p class="tradeoff">App cài cho <strong>riêng tài khoản Windows đang dùng</strong>, không cần quyền admin, không hiện cửa sổ UAC. Muốn cài cho mọi tài khoản trên máy thì đổi ở trang đầu của trình cài — lúc đó mới cần admin.</p>
+      </article>
+
+      <article class="card">
+        <div class="card-top">
+          <h3>Cách C — bản portable</h3>
+          <span class="tag quiet">Không cài gì</span>
+        </div>
+        <p>Dùng khi chỉ chạy tạm một buổi, hoặc máy không cho cài phần mềm.</p>
+        <ol class="steps">
+          <li>Cũng ở trang tải trên, lấy file <code>SerialPasteBot-Portable.exe</code> (~57 MB).</li>
+          <li>Double-click là chạy, không cài gì lên máy.</li>
+        </ol>
+        <p class="tradeoff">Đổi lại: <strong>mỗi lần mở chậm vài giây</strong> vì phải tự giải nén ra thư mục tạm, không có lối tắt ngoài Desktop, và <strong>không cập nhật được bằng <code>Cap-nhat.bat</code></strong> — ra bản mới phải tải tay lại.</p>
+      </article>
+
+    </div>
+  </section>
+
+  <section id="smartscreen">
+    <div class="shead"><span class="snum">02</span><h2>Khi Windows chặn lần đầu</h2></div>
+    <p>Hiện bảng xanh <strong>“Windows protected your PC”</strong> là chuyện bình thường: file chưa mua chứng thư ký số nên Windows chưa nhận ra người phát hành.</p>
+    <p>Bấm <strong>More info</strong> → <strong>Run anyway</strong>.</p>
+    <div class="note warn">
+      <span class="label">Đừng tự xử lý phần này</span>
+      <p>Nếu phần mềm diệt virus xoá mất file, báo người phát hành để họ gửi qua đường khác. <strong>Đừng tự tắt phần mềm diệt virus.</strong></p>
+    </div>
+  </section>
+
+  <section id="landau">
+    <div class="shead"><span class="snum">03</span><h2>Mở app lần đầu</h2></div>
+    <p>Mở <strong>Serial Paste Bot</strong> từ lối tắt ngoài Desktop hoặc trong Start Menu.</p>
+
+    <h3>Kiểm tra bot có thấy máy ảo không</h3>
+    <ol class="steps">
+      <li><strong>Bật LDPlayer trước</strong>, để máy ảo chạy hẳn lên màn hình Android.</li>
+      <li>Trong bot, bấm nút <strong>Refresh</strong>.</li>
+      <li>Danh sách instance phải hiện tên máy ảo của bạn. <strong>Tick chọn</strong> đúng một cái.</li>
+    </ol>
+    <p>Bấm Refresh mà danh sách trống thì xem mục <a href="#suco">Máy ảo không hiện ra</a>.</p>
+
+    <h3>Chọn file Excel và kiểm cột</h3>
+    <ol class="steps">
+      <li>Bấm chọn file Excel đơn hàng.</li>
+      <li>App tự đoán sheet và các cột theo dòng tiêu đề — <strong>vẫn phải nhìn lại một lượt</strong>, nhất là cột serial.</li>
+      <li>Chỉnh <strong>hàng bắt đầu / hàng kết thúc</strong> nếu chỉ chạy một phần danh sách.</li>
+    </ol>
+    <div class="note">
+      <span class="label">Đóng file Excel trước khi bấm Start</span>
+      <p>Bot ghi kết quả thẳng vào file nguồn. File đang mở trong Excel thì bot vẫn chạy nhưng <strong>không ghi được kết quả</strong>.</p>
+    </div>
+
+    <h3>Kiểm lại cấu hình kho</h3>
+    <p>Đây là chỗ dễ sai nhất trên máy mới. Các ô cấu hình nhớ theo <strong>từng tài khoản Windows</strong>, nên máy mới lần đầu chạy sẽ về giá trị mặc định.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Ô</th><th>Mặc định</th><th>Phải làm gì</th></tr></thead>
+        <tbody>
+          <tr><td>Mã tote</td><td><code>T001</code></td><td>Sửa cho đúng kho đang chạy</td></tr>
+          <tr><td>Mã bin</td><td><code>PYTES</code></td><td>Sửa cho đúng kho. Để trống nếu đơn trải nhiều vị trí — bot sẽ đi theo vị trí app chỉ</td></tr>
+          <tr><td>Đối chiếu số lượng</td><td>bật</td><td><strong>Cứ để bật.</strong> Nó so số sản phẩm app báo với số serial trong Excel rồi dừng <em>trước khi mở phiên</em>, tức là lúc chưa động gì tới kho</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note warn">
+      <span class="label">Sai chỗ này là lấy nhầm hàng</span>
+      <p>Hai mã mặc định trên là của kho hiện tại. <strong>Kho khác mà không sửa là bot lấy nhầm hàng thật.</strong></p>
+    </div>
+  </section>
+
+  <section id="chaythu">
+    <div class="shead"><span class="snum">04</span><h2>Chạy thử một mã</h2></div>
+    <p>Đừng chạy cả danh sách ngay trong lần đầu trên máy mới.</p>
+    <ol class="steps">
+      <li>Bấm <strong>Start</strong>.</li>
+      <li>Hộp <strong>xem trước</strong> hiện ra, cho tick từng mã. <strong>Bỏ tick hết, chỉ chừa đúng một mã.</strong></li>
+      <li>Xác nhận và xem bot chạy trọn mã đó.</li>
+      <li>Đúng như mong đợi thì mới quay lại chạy cả danh sách.</li>
+    </ol>
+    <p>Một mã chạy đúng là đủ để biết ba việc: ADB thông, app kho phản hồi đúng, và cấu hình kho không sai.</p>
+  </section>
+
+  <section id="capnhat">
+    <div class="shead"><span class="snum">05</span><h2>Cập nhật về sau</h2></div>
+    <p>Bấm lại <code>Cap-nhat.bat</code>. Nó tự tải bản mới nhất, tự đóng app nếu đang mở, cài đè rồi mở lại.</p>
+    <p>Không phải gỡ bản cũ trước. Kịch bản đã lưu, log và phiên chạy dở <strong>không bị mất</strong> — chúng nằm ngoài thư mục cài.</p>
+  </section>
+
+  <section id="go">
+    <div class="shead"><span class="snum">06</span><h2>Gỡ cài đặt</h2></div>
+    <p><strong>Settings → Apps → Serial Paste Bot → Uninstall</strong>.</p>
+    <p>Trình gỡ sẽ hỏi có xoá luôn dữ liệu cá nhân (log, ảnh chụp, kịch bản đã lưu, phiên dở) không. Định cài lại thì chọn <strong>Không</strong> để giữ kịch bản.</p>
+  </section>
+
+  <section id="suco">
+    <div class="shead"><span class="snum">07</span><h2>Sự cố thường gặp</h2></div>
+
+    <div class="fix">
+      <details>
+        <summary>Máy ảo không hiện ra khi bấm Refresh</summary>
+        <div class="body">
+          <ol class="steps">
+            <li>LDPlayer đã bật chưa, và đã lên hẳn màn hình Android chưa? Đang khởi động thì chưa thấy.</li>
+            <li>Mở PowerShell gõ <code>adb devices</code> — phải thấy một dòng có chữ <code>device</code>.</li>
+            <li>LDPlayer cài ở chỗ lạ (không phải <code>C:\LDPlayer\...</code>) thì chạy lệnh dưới rồi <strong>mở lại bot</strong>.</li>
+          </ol>
+          <pre><code>setx LDPLAYER_DIR "D:\Duong\Dan\Toi\LDPlayer9"</code></pre>
+          <p>Chế độ <strong>xuất kho theo mã OR chỉ chạy qua ADB</strong>, không có đường lui gõ bàn phím, nên không tìm thấy <code>adb.exe</code> là không chạy được. Bot sẽ báo thẳng có phải do thiếu <code>adb.exe</code> hay không.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary><code>Cap-nhat.bat</code> báo không tải được</summary>
+        <div class="body">
+          <p>Theo đúng thứ tự trong bảng thông báo của nó:</p>
+          <ol class="steps">
+            <li>Kiểm tra máy có vào mạng được không.</li>
+            <li>Mở trang tải bằng trình duyệt xem tải tay có được không — được thì dùng <strong>Cách B</strong>.</li>
+            <li>Trình duyệt tải được mà file <code>.bat</code> thì không: nhiều khả năng phần mềm diệt virus hoặc proxy công ty chặn. Báo người phát hành.</li>
+          </ol>
+        </div>
+      </details>
+
+      <details>
+        <summary>Bộ cài báo lỗi, không cài xong</summary>
+        <div class="body">
+          <p>Hay gặp nhất là <strong>app vẫn đang chạy</strong>. Đóng Serial Paste Bot — nhớ xem cả biểu tượng dưới khay hệ thống ở góc phải thanh taskbar — rồi chạy lại.</p>
+          <p>Vẫn lỗi thì gửi mã lỗi hiện trên màn hình cho người phát hành.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Chạy xong không thấy kết quả trong Excel</summary>
+        <div class="body">
+          <p>Kiểm tra lúc bấm Start file có đang mở trong Excel không. Bot ghi thẳng vào file nguồn nên file đang mở thì không ghi được. Đóng file rồi chạy lại.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Cần gửi thông tin để người phát hành xem lỗi</summary>
+        <div class="body">
+          <p>Trong app: <strong>Công cụ → Mở thư mục log</strong>, gửi file log của phiên vừa chạy. Ảnh chụp lúc lỗi nằm cùng chỗ, trong thư mục <code>screenshots</code>.</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <footer>
+    <p>Serial Paste Bot 2.1.0 &middot; Bản dựng từ mã nguồn ngày 12/08/2026</p>
+  </footer>
+
+</div>

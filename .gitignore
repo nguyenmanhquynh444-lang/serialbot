@@ -1,0 +1,38 @@
+# Repo serialbot để PUBLIC (Releases phải public thì Cap-nhat.bat mới tải được),
+# nên mọi thứ dưới đây phải nằm ngoài git - xem deploy/README.md.
+
+# --- Dữ liệu kho thật: đơn hàng, serial, kết quả chạy ---
+# ĐỪNG XÓA DÒNG NÀY. Thư mục này chứa file Excel đơn thật của kho production;
+# lỡ commit lên repo public là lộ số liệu khách hàng ra ngoài.
+data chạy/
+data_ket_qua_*.xlsx
+~$*.xlsx
+
+# --- App ghi ra lúc chạy ---
+logs/
+screenshots/
+*.log
+session.json
+device_profile.json
+
+# --- Build ---
+build/
+dist/
+*.spec.bak
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# --- Máy ai nấy dùng, không chia sẻ ---
+# settings.local.json ghi đường dẫn tuyệt đối của riêng một máy (C:\Users\<tên>\...).
+.claude/settings.local.json
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
