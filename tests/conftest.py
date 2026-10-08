@@ -4,6 +4,12 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def isolated_run_journal(tmp_path, monkeypatch):
+    import run_journal
+    monkeypatch.setattr(run_journal, "journal_path", lambda: str(tmp_path / "journal.sqlite3"))
+
+
+@pytest.fixture(autouse=True)
 def isolated_qsettings(tmp_path, monkeypatch):
     """BotGUI() dựng QSettings(APP_ORG, "SerialPasteBot") - đúng chỗ bản cài thật
     lưu cấu hình (trên Windows là registry HKCU\\Software\\SerialBotOrg).

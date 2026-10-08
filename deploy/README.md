@@ -76,6 +76,10 @@ một nội dung:
 
 Sửa nội dung thì nhớ sửa **cả hai** cho khỏi lệch.
 
+Người vận hành kho (chạy nhập hàng theo mã check-in, xuất kho theo mã OR) thì gửi thêm
+[`HUONG-DAN-NHAP-XUAT-SERIAL.md`](HUONG-DAN-NHAP-XUAT-SERIAL.md). Tài liệu này chỉ có bản
+markdown, chưa có bản trang web.
+
 Dữ liệu cá nhân — log, ảnh chụp, kịch bản đã lưu, phiên chạy dở trong
 `%LOCALAPPDATA%\SerialBot` — nằm ngoài thư mục cài nên cập nhật không đụng tới.
 

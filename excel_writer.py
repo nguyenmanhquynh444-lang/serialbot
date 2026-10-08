@@ -4,6 +4,9 @@ Ghi kết quả chạy vào một sheet mới trong chính file nguồn, và d�
 riêng khi người dùng chủ động bấm Export.
 """
 import logging
+import os
+import tempfile
+import time
 from datetime import datetime
 
 from openpyxl import Workbook, load_workbook
@@ -11,6 +14,22 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 from actions import REASON_LABELS, REASON_NOT_FOUND
+from verification import UNVERIFIED, VERIFICATION_LABELS
+
+
+def atomic_save(workbook, path):
+    """A failed ZIP write must leave the existing workbook intact."""
+    descriptor, temporary = tempfile.mkstemp(prefix=".serialbot_", suffix=os.path.splitext(path)[1],
+                                             dir=os.path.dirname(os.path.abspath(path)))
+    os.close(descriptor)
+    try:
+        workbook.save(temporary)
+        with open(temporary, "r+b") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
 
 STATUS_FILL = {
     "OK": PatternFill("solid", fgColor="1E4620"),
@@ -113,29 +132,37 @@ class ResultWriter:
 
     HEADERS = [
         "Hang Excel", "Serial", "Trang thai", "Phan hoi app",
-        "Thoi gian", "Ly do", "Anh chup",
+        "Thoi gian", "Ly do", "Anh chup", "Muc xac nhan",
     ]
-    WIDTHS = (12, 24, 14, 44, 12, 22, 40)
+    WIDTHS = (12, 24, 14, 44, 12, 22, 40, 24)
 
     def __init__(
         self,
         source_path: str,
         data_sheet: str | None = None,
         save_every: int = 50,
+        result_sheet: str | None = None,
+        save_initial: bool = True,
+        auto_save: bool = True,
     ):
         self.path = source_path
         # File có macro thì phải nói rõ là giữ: mặc định openpyxl bỏ phần VBA đi,
         # lưu xong là file .xlsm còn nguyên đuôi nhưng sạch macro.
         keep_vba = source_path.lower().endswith((".xlsm", ".xltm"))
         self.wb = load_workbook(source_path, keep_vba=keep_vba)
-        self.sheet_name = result_sheet_name(self.wb)
-        self.ws = self.wb.create_sheet(self.sheet_name)
+        self.sheet_name = result_sheet or result_sheet_name(self.wb)
+        existing = self.sheet_name in self.wb.sheetnames
+        self.ws = self.wb[self.sheet_name] if existing else self.wb.create_sheet(self.sheet_name)
         self.data_sheet = data_sheet
         self.save_every = save_every
-        self._pending = 0
-        self._next_row = 2
+        self.auto_save = auto_save
+        self._pending = 1
+        self._next_row = self.ws.max_row + 1 if existing else 2
+        self._row_index = {self.ws.cell(r, 1).value: r for r in range(2, self._next_row)}
+        self._last_save = time.monotonic()
 
-        self.ws.append(self.HEADERS)
+        for index, header in enumerate(self.HEADERS, 1):
+            self.ws.cell(1, index, header)
         for cell in self.ws[1]:
             cell.fill = HEADER_FILL
             cell.font = HEADER_FONT
@@ -145,7 +172,9 @@ class ResultWriter:
 
         # Lưu ngay khi chưa chạy dòng nào: quyền ghi và khóa file lộ ra ở đây,
         # lúc bên gọi còn hủy phiên được, chứ không phải ở phút thứ mười.
-        self.wb.save(self.path)
+        if save_initial:
+            atomic_save(self.wb, self.path)
+            self._pending = 0
 
     # ------------------------------------------------------------------ ghi
 
@@ -157,6 +186,7 @@ class ResultWriter:
         response_text: str,
         screenshot_path: str | None,
         reason: str = "",
+        verification: str = UNVERIFIED,
     ):
         values = [
             row,
@@ -166,20 +196,24 @@ class ResultWriter:
             datetime.now().strftime("%H:%M:%S"),
             REASON_LABELS.get(reason, reason or ""),
             screenshot_path or "",
+            VERIFICATION_LABELS.get(verification, VERIFICATION_LABELS[UNVERIFIED]),
         ]
         fill = STATUS_FILL.get(status)
         font = STATUS_FONT.get(status)
+        target_row = self._row_index.get(row, self._next_row)
         for index, value in enumerate(values, start=1):
-            cell = self.ws.cell(row=self._next_row, column=index, value=value)
+            cell = self.ws.cell(row=target_row, column=index, value=value)
             if index == 3:              # chỉ tô cột Trạng thái, tô cả dòng thì rối
                 if fill:
                     cell.fill = fill
                 if font:
                     cell.font = font
 
-        self._next_row += 1
+        if row not in self._row_index:
+            self._row_index[row] = target_row
+            self._next_row += 1
         self._pending += 1
-        if self._pending >= self.save_every:
+        if self.auto_save and (self._pending >= self.save_every or time.monotonic() - self._last_save >= 30):
             self.save()
 
     def add_cell(self, row: int, column_letter: str, value):
@@ -209,8 +243,9 @@ class ResultWriter:
         if self._pending == 0:
             return
         try:
-            self.wb.save(self.path)
+            atomic_save(self.wb, self.path)
             self._pending = 0
+            self._last_save = time.monotonic()
         except PermissionError:
             # Gần như luôn là file đang mở trong Excel. Giữ lại trong bộ nhớ và
             # thử tiếp ở lần lưu sau, đừng làm đổ phiên chạy vì một lần khóa file.
@@ -220,8 +255,9 @@ class ResultWriter:
             )
 
     def finalize(self):
-        self.wb.save(self.path)
+        atomic_save(self.wb, self.path)
         self._pending = 0
+        self._last_save = time.monotonic()
 
 
 def write_report(path: str, records: list[dict], summary: dict):
@@ -344,6 +380,9 @@ def _write_summary_sheet(ws, summary: dict):
         ("Tong so serial", summary.get("total", 0)),
         ("Da xu ly", summary.get("done", 0)),
         ("Thanh cong", summary.get("success", 0)),
+        ("Da xac nhan", summary.get("confirmed", 0)),
+        ("Khong phat hien loi", summary.get("inferred", 0)),
+        ("Chua xac minh", summary.get("unverified", 0)),
         ("Loi", summary.get("error", 0)),
         ("  - trong do: khong tim thay serial", summary.get("not_found", 0)),
         ("Khong xac dinh", summary.get("unknown", 0)),
@@ -369,7 +408,7 @@ def _write_summary_sheet(ws, summary: dict):
 
 
 def _write_records_sheet(ws, records: list[dict]):
-    ws.append(["Thoi gian", "Hang Excel", "Serial", "Trang thai", "Ly do", "Thong bao"])
+    ws.append(["Thoi gian", "Hang Excel", "Serial", "Trang thai", "Ly do", "Thong bao", "Muc xac nhan"])
     for cell in ws[1]:
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
@@ -384,11 +423,12 @@ def _write_records_sheet(ws, records: list[dict]):
             status,
             REASON_LABELS.get(reason, reason or ""),
             record.get("message", ""),
+            VERIFICATION_LABELS.get(record.get("verification", UNVERIFIED), VERIFICATION_LABELS[UNVERIFIED]),
         ])
         font = STATUS_FONT.get(status)
         if font:
             ws.cell(row=ws.max_row, column=4).font = font
 
-    for col_idx, width in enumerate((12, 12, 24, 12, 22, 50), start=1):
+    for col_idx, width in enumerate((12, 12, 24, 12, 22, 50, 24), start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = width
     ws.freeze_panes = "A2"

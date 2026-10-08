@@ -36,6 +36,14 @@ def build(tmp_path, rows, merges=(), header=True):
     return str(path)
 
 
+def test_preview_rejects_header_even_when_selected_range_includes_it(tmp_path):
+    path = build(tmp_path, [("MaOR", "Serial"), ("OR1", "S1")], header=False)
+    groups, warnings = read_bill_groups(path, None, "A", "B", 1)
+    assert [group["bill"] for group in groups] == ["OR1"]
+    assert groups[0]["rows"][0]["value"] == "S1"
+    assert warnings
+
+
 def test_merged_bill_cell_is_carried_down_to_every_serial(tmp_path):
     """Đúng cấu trúc file thật: mã vận đơn là ô gộp trải trên các dòng serial."""
     path = build(

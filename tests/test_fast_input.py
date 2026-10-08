@@ -145,7 +145,7 @@ def test_enter_stays_a_separate_keyevent_until_it_is_proven(qapp):
     device = FakeDevice()
     AdbBackend(device).type_and_submit("ABC123", "enter", clear_first=False)
 
-    assert device.commands == ["input text 'ABC123'; input keyevent 66"]
+    assert device.commands == ["input text 'ABC123' && input keyevent 66"]
 
 
 def test_enabling_text_submit_folds_enter_into_the_typed_string(qapp):
@@ -175,8 +175,8 @@ def test_text_submit_is_only_offered_once_the_app_is_known_to_clear_its_field(qa
     assert worker.backend.submits_with_text is False
 
 
-def test_a_virtual_machine_that_swallows_the_newline_is_caught_and_undone(qapp):
-    """Serial còn nguyên trong ô = app chưa quét. Bấm Enter bù rồi quay về cách cũ."""
+def test_unsettled_newline_submission_never_sends_an_extra_enter(qapp):
+    """A field that still holds text cannot prove the scan wasn't delivered."""
     device = FakeDevice(xml=LEFTOVER_SCREEN)
     worker = make_worker(device)
     worker.backend.enable_text_submit()
@@ -186,8 +186,9 @@ def test_a_virtual_machine_that_swallows_the_newline_is_caught_and_undone(qapp):
     )
 
     assert worker.backend.submits_with_text is False
-    assert "input keyevent 66" in device.commands
-    assert verdict["status"] in ("OK", "UNKNOWN")
+    assert "input keyevent 66" not in device.commands
+    assert verdict["status"] == "UNKNOWN"
+    assert verdict["adb_failed"] is True
 
 
 def test_an_empty_field_after_typing_confirms_the_newline_arrived(qapp):
@@ -202,7 +203,7 @@ def test_an_empty_field_after_typing_confirms_the_newline_arrived(qapp):
     assert "input keyevent 66" not in device.commands
 
 
-def test_a_failing_input_command_falls_back_instead_of_looking_like_a_dead_device(qapp):
+def test_a_failing_guarded_input_is_not_replayed(qapp):
     device = FakeDevice(input_fails=True)
     backend = make_backend(device)
     backend.enable_text_submit()
@@ -210,7 +211,7 @@ def test_a_failing_input_command_falls_back_instead_of_looking_like_a_dead_devic
     with pytest.raises(Exception):
         backend.type_and_submit_guarded("ABC123", "enter", clear_first=False)
 
-    assert backend.submits_with_text is False          # thử bỏ lối tắt trước
+    assert len(device.commands) == 1                  # a failure can follow delivery
 
 
 # --- soi cửa sổ và gõ trong cùng một lệnh -----------------------------------

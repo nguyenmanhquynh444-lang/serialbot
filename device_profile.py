@@ -20,12 +20,57 @@ thoại đều hết hiệu lực, lúc đó dò lại từ đầu còn hơn tin
 import json
 import logging
 import os
+import threading
+import tempfile
+from functools import wraps
+from contextlib import contextmanager
 
 from paths import user_data_dir
 
 logger = logging.getLogger(__name__)
 
 FILENAME = "device_profile.json"
+_LOCK = threading.RLock()
+
+
+@contextmanager
+def _process_lock():
+    """Serialize read/merge/write between multiple bot processes as well."""
+    path = profile_path() + ".lock"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a+b") as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"0")
+            stream.flush()
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            stream.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _locked(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        with _LOCK:
+            try:
+                with _process_lock():
+                    return function(*args, **kwargs)
+            except OSError as exc:
+                logger.warning("Không khóa được profile: %s", exc)
+                return {} if function.__name__ == "load" else None
+    return wrapper
 
 
 def profile_path() -> str:
@@ -48,6 +93,7 @@ def _read_all() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+@_locked
 def load(key: str) -> dict:
     """Những gì đã dò được cho khóa này ở phiên trước. Không có thì trả {}."""
     if not key:
@@ -56,6 +102,7 @@ def load(key: str) -> dict:
     return entry if isinstance(entry, dict) else {}
 
 
+@_locked
 def save(key: str, values: dict) -> None:
     """
     Ghi thêm/đè các khóa trong `values`, giữ nguyên phần còn lại.
@@ -74,11 +121,16 @@ def save(key: str, values: dict) -> None:
     data[key] = entry
 
     path = profile_path()
-    tmp_path = path + ".tmp"
+    tmp_path = None
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        descriptor, tmp_path = tempfile.mkstemp(prefix=".profile_", dir=os.path.dirname(path))
+        os.close(descriptor)
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp_path, path)
     except OSError as e:
         logger.warning("Không ghi được %s: %s", FILENAME, e)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)

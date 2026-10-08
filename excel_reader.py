@@ -316,6 +316,16 @@ def read_bill_groups(
             bill = clean_serial(raw_bill)
             serial = clean_serial(raw_serial)
 
+            header_bill = re.sub(r"[^a-z0-9]", "", bill.lower())
+            header_serial = re.sub(r"[^a-z0-9]", "", serial.lower())
+            if header_bill in ("or", "maor", "checkin", "macheckin", "bill", "mavandon", "mvd") and \
+                    header_serial in ("serial", "seri", "imei", "sn", "soseri"):
+                warnings.append(f"Dòng {current_row}: bỏ dòng tiêu đề '{bill}' / '{serial}'.")
+                current_bill = ""
+                current_ref = ""
+                current_row += 1
+                continue
+
             if bill:
                 current_bill = bill
             if ref_idx:

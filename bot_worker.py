@@ -25,8 +25,12 @@ from actions import REASON_APP_ERROR, REASON_DIALOG, REASON_NOT_FOUND
 import browser_backend
 import device_profile
 from excel_reader import clean_serial
+from verification import CONFIRMED, INFERRED, UNVERIFIED, VERIFICATION_LABELS
+from version import APP_VERSION
+from telemetry import measure
 from screen_reader import (
     ScreenReader,
+    adb_budget,
     current_focus_window,
     dialog_marker,
     dialog_message,
@@ -186,6 +190,8 @@ class BotWorker(QThread):
         run_target: str = TARGET_ADB,
         browser_port: int = browser_backend.DEFAULT_DEBUG_PORT,
         browser_url: str = "",
+        journal=None,
+        run_id=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -262,6 +268,14 @@ class BotWorker(QThread):
         self._pause_event = threading.Event()
         self._pause_event.set()
         self._stop_flag = threading.Event()
+        self.journal = journal
+        self.run_id = run_id
+        self.completion_state = "failed"
+        self._row_operations = {}
+        self.pause_seconds = 0.0
+        self._published = {}
+        self._current_counters = None
+        self._current_total = 0
 
     @property
     def screen(self):
@@ -295,6 +309,7 @@ class BotWorker(QThread):
         """Returns False if no usable backend could be selected and the run must abort."""
         if self.run_target == TARGET_BROWSER:
             return self._select_browser_backend()
+        self.adb_client.should_stop = self._stop_flag.is_set
 
         if self.prefer_adb_input:
             adb_backend = AdbBackend(self.adb_client)
@@ -364,6 +379,11 @@ class BotWorker(QThread):
     def run(self):
         try:
             self._run()
+        except Exception as exc:
+            logger.exception("Serial run failed run_id=%s", self.run_id)
+            self.completion_state = "failed"
+            self.error_occurred.emit(str(exc))
+            self.finished_all.emit()
         finally:
             # Ngắt kết nối dù phiên chạy kết thúc kiểu gì: bỏ mặc thì tiến trình
             # driver của Playwright sống dai hơn cả app.
@@ -383,6 +403,7 @@ class BotWorker(QThread):
                 self.adb_client,
                 screenshot_dir=self.screenshot_dir,
                 capture_screenshot_on_error=self.capture_screenshot,
+                should_stop=self._stop_flag.is_set,
             )
 
         total = len(self.serials)
@@ -395,6 +416,11 @@ class BotWorker(QThread):
             total, type(self.backend).__name__,
             (self.recipe_name or "yes") if self.runner else "no",
         )
+        logger.info("Run metadata: run_id=%s version=%s mode=serial instance=%s config=%s",
+                    self.run_id, APP_VERSION, self.instance_name,
+                    {"verify": self.verify_result, "delay": self.delay_seconds,
+                     "enter_delay": self.enter_delay_seconds, "product_delay": self.product_code_delay,
+                     "recipe": self.recipe_name, "target": self.run_target})
 
         # Kết quả của dòng vừa chạy được giữ lại một nhịp trước khi công bố. Hộp
         # thoại trả lời cho nó có thể hiện muộn tới mức phải sang dòng sau mới
@@ -409,12 +435,20 @@ class BotWorker(QThread):
             if not self._pause_event.is_set() and pending is not None:
                 # Sắp đứng chờ người dùng bấm Resume: công bố nốt dòng đang giữ
                 # để bảng kết quả không thiếu dòng suốt lúc dừng.
+                pending = self._finalize_pending(pending)
                 self._publish(pending[0], pending[1], counters, total)
                 pending = None
 
+            pause_started = time.monotonic()
             self._pause_event.wait()
+            self.pause_seconds += time.monotonic() - pause_started
             if self._stop_flag.is_set():
                 break
+
+            if self.journal and self.run_id:
+                self._row_operations[item.row] = self.journal.begin(
+                    self.run_id, "serial", row=item.row,
+                    payload={"serial": item.value, "instance": self.instance_name})
 
             if self.runner:
                 try:
@@ -431,6 +465,16 @@ class BotWorker(QThread):
             if pending is not None:
                 self._publish(pending[0], pending[1], counters, total)
             pending = (item, result)
+            # Persist BEFORE GUI signals or the next serial can run. Keep the
+            # operation pending if delivery is ambiguous.
+            if self.journal and self.run_id:
+                record = self._result_record(item, result)
+                operation = None if result.get("adb_failed") else self._row_operations.get(item.row)
+                self.journal.record_result(self.run_id, record, operation)
+            if result.get("adb_failed"):
+                self.completion_state = "uncertain"
+                self.error_occurred.emit("Lệnh ADB chưa rõ đã tới app; bot dừng để đối chiếu, không gửi lại.")
+                break
 
             if result.get("adb_failed"):
                 consecutive_adb_failures += 1
@@ -480,6 +524,11 @@ class BotWorker(QThread):
 
             self._interruptible_sleep(self.delay_seconds)
 
+        else:
+            self.completion_state = "complete"
+        if self._stop_flag.is_set():
+            self.completion_state = "stopped"
+        pending = self._finalize_pending(pending)
         pending = self._apply_correction(pending)
         if pending is not None:
             self._publish(pending[0], pending[1], counters, total)
@@ -491,6 +540,44 @@ class BotWorker(QThread):
         )
         self.finished_all.emit()
 
+    def _finalize_pending(self, pending):
+        """Catch a final late reply before pause/end; absence remains inferred."""
+        if pending is None or not self.verify_result or self.runner or self._stop_flag.is_set():
+            return pending
+        item, result = pending
+        if result.get("status") != "OK" or not self._clean_focus:
+            return pending
+        deadline = time.monotonic() + max(DIALOG_GRACE_UNGUARDED_SECONDS, self.response_timeout)
+        while time.monotonic() < deadline and not self._stop_flag.is_set():
+            with adb_budget(self.adb_client, deadline):
+                focus = self.screen.focused_window()
+            if focus is None:
+                return item, {**result, "status": "UNKNOWN", "verification": UNVERIFIED,
+                              "message": "Không đọc được phản hồi cuối", "adb_failed": True}
+            if focus and focus != self._clean_focus:
+                with adb_budget(self.adb_client, deadline):
+                    xml = self.screen.dump_xml()
+                if xml and find_dismiss_button(xml):
+                    verdict = self._classify_dialog(xml)
+                    dismissed = self._dismiss_error_dialog(xml)
+                    return item, {**result, **verdict, "verification": CONFIRMED,
+                                  "message": self._build_message(verdict["status"], verdict.get("reason", ""),
+                                                                 verdict.get("response_text", ""), verdict),
+                                  "dismiss_failed": not dismissed}
+                return item, {**result, "status": "UNKNOWN", "verification": UNVERIFIED,
+                              "message": "Màn hình đổi ở phản hồi cuối, cần kiểm tra"}
+            time.sleep(DIALOG_POLL_INTERVAL_SECONDS)
+        return pending
+
+    def _result_record(self, item, result):
+        return {
+            "row": item.row, "serial": clean_serial(item.value), "status": result["status"],
+            "verification": result.get("verification", UNVERIFIED),
+            "message": result.get("message", ""), "response_text": result.get("response_text", ""),
+            "reason": result.get("reason", ""), "screenshot_path": result.get("screenshot_path"),
+            "cell_writes": result.get("cell_writes", {}), "time": time.strftime("%H:%M:%S"),
+        }
+
     def _apply_correction(self, pending: tuple | None) -> tuple | None:
         """
         Dán kết luận muộn (hộp thoại của dòng trước) vào đúng dòng đã gõ ra nó.
@@ -499,10 +586,19 @@ class BotWorker(QThread):
         đọc từ chính màn hình của nó, đáng tin hơn.
         """
         correction, self._pending_correction = self._pending_correction, None
-        if correction is None or pending is None:
+        if correction is None:
             return pending
 
         row, verdict = correction
+        if pending is None or pending[0].row != row:
+            published = self._published.get(row)
+            if published and published[1]["status"] == "OK":
+                item, result = published
+                corrected = {**result, **verdict, "verification": CONFIRMED,
+                             "message": self._build_message(verdict["status"], verdict.get("reason", ""),
+                                                            verdict.get("response_text", ""), verdict)}
+                self._publish(item, corrected, self._current_counters, self._current_total)
+            return pending
         item, result = pending
         if item.row != row or result["status"] != "OK":
             return pending
@@ -516,23 +612,43 @@ class BotWorker(QThread):
             ),
             "response_text": verdict.get("response_text", ""),
             "reason": verdict.get("reason", ""),
+            "verification": CONFIRMED,
         }
 
     def _publish(self, item, result: dict, counters: dict, total: int) -> None:
-        counters["done"] += 1
-        if result["status"] == "OK":
+        self._current_counters, self._current_total = counters, total
+        old = self._published.get(item.row)
+        if old is None:
+            counters["done"] += 1
+        else:
+            old_result = old[1]
+            if old_result["status"] == "OK" and old_result.get("verification") == CONFIRMED:
+                counters["success"] -= 1
+            elif old_result["status"] == "ERROR":
+                counters["error"] -= 1
+            elif old_result["status"] == "UNKNOWN":
+                counters["unknown"] -= 1
+        self._published[item.row] = (item, dict(result))
+        if result["status"] == "OK" and result.get("verification") == CONFIRMED:
             counters["success"] += 1
         elif result["status"] == "ERROR":
             counters["error"] += 1
-        else:
+        elif result["status"] == "UNKNOWN":
             counters["unknown"] += 1
 
         clean_val = clean_serial(item.value)
         self.log_entry.emit(item.row, clean_val, result["status"], result["message"])
+        record = self._result_record(item, result)
+        if self.journal and self.run_id:
+            self.journal.record_result(self.run_id, record)
+            if result.get("adb_failed"):
+                self.journal.resolve(self._row_operations.get(item.row), "pending")
+                self.completion_state = "uncertain"
         self.result_ready.emit({
             "row": item.row,
             "serial": clean_val,
             "status": result["status"],
+            "verification": result.get("verification", UNVERIFIED),
             "message": result["message"],
             "response_text": result.get("response_text", ""),
             "reason": result.get("reason", ""),
@@ -554,6 +670,7 @@ class BotWorker(QThread):
             time.sleep(step)
             elapsed += step
 
+    @measure("serial")
     def _process_with_recipe(self, item) -> dict:
         clean_val = clean_serial(item.value)
         if not clean_val:
@@ -564,6 +681,7 @@ class BotWorker(QThread):
         )
         return {
             "status": outcome.status,
+            "verification": getattr(outcome, "verification", UNVERIFIED),
             "message": outcome.message,
             "response_text": outcome.response_text,
             "reason": outcome.reason,
@@ -574,6 +692,7 @@ class BotWorker(QThread):
             "focus_failed": outcome.focus_failed,
         }
 
+    @measure("serial")
     def _process_serial(self, row: int, serial: str) -> dict:
         clean_val = clean_serial(serial)
         if not clean_val:
@@ -673,6 +792,8 @@ class BotWorker(QThread):
         self._previous_row = row
 
         status = verdict["status"]
+        verification = verdict.get("verification", CONFIRMED if status == "ERROR" else
+                                   (INFERRED if status == "OK" else UNVERIFIED))
         response_text = verdict.get("response_text", "")
         reason = verdict.get("reason", "")
 
@@ -682,7 +803,11 @@ class BotWorker(QThread):
 
         return {
             "status": status,
-            "message": self._build_message(status, reason, response_text, verdict),
+            "verification": verification,
+            "timing": {"input_ms": round(input_seconds*1000, 3),
+                       "verify_ms": round((total_seconds-input_seconds)*1000, 3)},
+            "message": (VERIFICATION_LABELS[verification] + ": " if status == "OK" else "") +
+                       self._build_message(status, reason, response_text, verdict),
             "response_text": response_text,
             "reason": reason,
             "screenshot_path": screenshot_path,
@@ -790,6 +915,8 @@ class BotWorker(QThread):
         """
         # Chỉ chốt cửa sổ khi đã biết màn hình sạch trông thế nào, và khi hộp
         # thoại của app này thật sự làm đổi cửa sổ focus.
+        if self._stop_flag.is_set():
+            raise AdbUnavailableError("Đã dừng trước khi gửi serial.")
         expected = ""
         if guard and self.verify_result and self._dialog_seen_by_dumpsys:
             expected = self._clean_focus_raw
@@ -820,7 +947,9 @@ class BotWorker(QThread):
 
         if self.enter_delay_seconds > 0:
             self.backend.type_serial(serial)
-            time.sleep(self.enter_delay_seconds)
+            self._interruptible_sleep(self.enter_delay_seconds)
+            if self._stop_flag.is_set():
+                raise AdbUnavailableError("Đã dừng trước khi gửi Enter; ô nhập cần đối chiếu.")
             self.backend.send_enter(self.enter_mode)
         else:
             self.backend.type_and_submit(serial, self.enter_mode, clear_first)
@@ -924,20 +1053,12 @@ class BotWorker(QThread):
             self._accept_text_submit()
             return verdict
 
-        logger.warning(
-            "Máy ảo không dịch ký tự xuống dòng thành Enter - quay về gửi Enter riêng."
-        )
+        logger.warning("Ô còn serial sau lệnh gộp; chưa rõ Enter đã được xử lý hay chưa.")
         backend.disable_text_submit()
         self._text_submit_probed = True
-        try:
-            backend.send_enter(self.enter_mode)
-        except AdbUnavailableError as e:
-            return {
-                "status": "UNKNOWN",
-                "response_text": f"Không gửi được Enter: {e}",
-                "adb_failed": True,
-            }
-        return self._read_result(serial)
+        return {"status": "UNKNOWN", "verification": UNVERIFIED,
+                "response_text": "Ô còn serial sau lệnh gộp; cần đối chiếu trước khi gửi thêm Enter.",
+                "adb_failed": True}
 
     def _accept_text_submit(self) -> None:
         self._text_submit_probed = True
@@ -1119,7 +1240,7 @@ class BotWorker(QThread):
 
         for kw in self.success_keywords:
             if kw and kw in normalized_content:
-                return {"status": "OK", "response_text": kw}
+                return {"status": "OK", "response_text": kw, "verification": CONFIRMED}
 
         # Không khớp từ khóa nào nhưng màn hình có nút đóng: chỉ lúc đó mới tốn
         # thêm một lượt dumpsys để hỏi xem đây có thật là hộp thoại không. Màn
@@ -1130,7 +1251,10 @@ class BotWorker(QThread):
         if self.success_keywords:
             return {"status": "UNKNOWN", "response_text": "No success/error keyword matched"}
 
-        return {"status": "OK", "response_text": "Typed successfully"}
+        echoed = any(self._normalize_match_text(serial) in self._normalize_match_text(n.get("text", ""))
+                     for n in list_nodes(content, False) if n.get("class") != "EditText") if serial else False
+        return {"status": "OK", "response_text": "Typed successfully",
+                "verification": CONFIRMED if echoed else INFERRED}
 
     # ------------------------------------------------------------ chờ phản hồi
 

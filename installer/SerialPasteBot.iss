@@ -63,6 +63,7 @@ Name: "desktopicon"; Description: "Tạo lối tắt ngoài Desktop"; GroupDescr
 [Files]
 Source: "{#PayloadDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\OPTIMIZATION_NOTES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"

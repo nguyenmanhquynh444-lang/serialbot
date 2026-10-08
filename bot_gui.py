@@ -62,10 +62,7 @@ from excel_reader import (
     read_serials,
 )
 from excel_writer import (
-    ResultWriter,
     find_formula_cells,
-    write_pick_report,
-    write_report,
 )
 from inbound_runner import InboundConfig, InboundRunner
 from pick_runner import DEFAULT_BIN_CODE, DEFAULT_TOTE, PickConfig, PickRunner
@@ -74,6 +71,9 @@ from paths import logs_dir, screenshots_dir
 from preview_dialog import BillPreviewDialog, PreviewDialog
 from recipes import ensure_classic_on_disk, list_recipes, load_recipe
 from session_manager import clear_session, load_session, save_session
+from run_journal import RunJournal, fingerprint
+from result_writer_worker import ResultWriterWorker, ReportWriterWorker
+from verification import CONFIRMED, INFERRED, UNVERIFIED
 from version import APP_DESCRIPTION, APP_NAME, APP_ORG, APP_VERSION
 
 logger = logging.getLogger(__name__)
@@ -436,7 +436,18 @@ class BotGUI(QMainWindow):
         self.excel_path: str | None = None
         self.serials_cache: list[SerialItem] = []
         self.all_records: list[dict] = []
-        self.result_writer: ResultWriter | None = None
+        self.result_writer: ResultWriterWorker | None = None
+        self.report_writer = None
+        self.journal = None
+        self.run_id = None
+        self._stop_requested = False
+        self._finishing = False
+        self._resumed_records = []
+        self._resumed_bills = []
+        self._result_sheet = None
+        self._run_finished_monotonic = None
+        self._run_source_path = None
+        self._run_sheet = None
         self.session_done_rows: set[int] = set()
         self.is_paused = False
         self.run_started_at: str | None = None
@@ -1090,11 +1101,14 @@ class BotGUI(QMainWindow):
         self.export_report_btn.setObjectName("exportErrorsBtn")
         self.export_report_btn.setEnabled(False)
         self.export_report_btn.clicked.connect(self._on_export_report)
+        self.review_progress_btn = QPushButton("Đối chiếu tiến độ")
+        self.review_progress_btn.clicked.connect(self._review_unresolved_progress)
 
         btn_row.addWidget(self.start_btn)
         btn_row.addWidget(self.pause_btn)
         btn_row.addWidget(self.stop_btn)
         btn_row.addWidget(self.retry_errors_btn)
+        btn_row.addWidget(self.review_progress_btn)
         btn_row.addWidget(self.export_report_btn)
         layout.addLayout(btn_row)
 
@@ -1114,10 +1128,11 @@ class BotGUI(QMainWindow):
         row = QHBoxLayout()
 
         self.stat_total_lbl = self._stat_block(row, "Processed", "0 / 0", "#e8e8f0")
-        self.stat_success_lbl = self._stat_block(row, "Success", "0", "#2ecc71")
+        self.stat_success_lbl = self._stat_block(row, "Đã xác nhận", "0", "#2ecc71")
         self.stat_error_lbl = self._stat_block(row, "Errors", "0", "#ff5c72")
         self.stat_not_found_lbl = self._stat_block(row, "Không tìm thấy", "0", "#ff9f43")
         self.stat_unknown_lbl = self._stat_block(row, "Unknown", "0", "#f1c40f")
+        self.stat_inferred_lbl = self._stat_block(row, "Không phát hiện lỗi", "0", "#4fc3f7")
 
         layout.addLayout(row)
         return frame
@@ -1370,6 +1385,8 @@ class BotGUI(QMainWindow):
         self._load_profile_by_name(name)
 
     def _load_profile_by_name(self, name: str):
+        if not self.pages.widget(1).isEnabled():
+            return
         self.settings.beginGroup(f"profiles/{name}")
         keys = self.settings.childKeys()
         if not keys:
@@ -1442,6 +1459,8 @@ class BotGUI(QMainWindow):
             self._load_excel_path(path)
 
     def _load_excel_path(self, path: str):
+        if not self.pages.widget(1).isEnabled():
+            return
         self.excel_path = path
         self.file_input.setText(os.path.basename(path))
 
@@ -1661,6 +1680,8 @@ class BotGUI(QMainWindow):
             )
 
     def _on_refresh_instances(self):
+        if not self.pages.widget(1).isEnabled():
+            return
         instances = list_ldplayer_instances()
         self.instances_list.clear()
         if not instances:
@@ -1693,6 +1714,14 @@ class BotGUI(QMainWindow):
     # ---------------------------------------------------------------- run lifecycle
 
     def _on_start(self):
+        if self.report_writer and self.report_writer.isRunning():
+            return
+        if (getattr(self, "_timer", None) and self._timer.isActive()) or (
+                self.loader_thread and self.loader_thread.isRunning()):
+            return
+        if any(w.isRunning() for w in self.workers) or self._finishing or (
+                self.result_writer and self.result_writer.isRunning()):
+            return
         if not self.excel_path:
             QMessageBox.warning(self, "Missing file", "Please select an Excel file first.")
             return
@@ -1732,6 +1761,8 @@ class BotGUI(QMainWindow):
         )
         self.loader_thread.finished.connect(self._on_excel_loaded)
         self.loader_thread.error.connect(self._on_excel_load_error)
+        self.pages.widget(1).setEnabled(False)
+        self.pages.widget(2).setEnabled(False)
         self.loader_thread.start()
 
     def _product_code_is_usable(self) -> bool:
@@ -1797,22 +1828,6 @@ class BotGUI(QMainWindow):
             )
             return
 
-        session = load_session(self.excel_path)
-        done_bills = set(session.get("done_bills") or []) if session else set()
-        if done_bills:
-            remaining = [g for g in groups if g["bill"] not in done_bills]
-            answer = QMessageBox.question(
-                self, "Chạy tiếp phiên trước?",
-                f"Lần trước đã xong {len(done_bills)} {unit}.\n\n"
-                f"Bỏ qua và chạy tiếp {len(remaining)} {unit} còn lại?\n\n"
-                "Chọn No để chạy lại từ đầu.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if answer == QMessageBox.StandardButton.Yes:
-                groups = remaining
-            else:
-                clear_session()
-
         dialog = BillPreviewDialog(
             groups, warnings, self, unit=unit,
             code_header="Mã check-in" if inbound else "Mã OR",
@@ -1823,16 +1838,23 @@ class BotGUI(QMainWindow):
         if not groups:
             return
 
+        groups = self._prepare_journal(groups, self.run_mode())
+        if groups is None:
+            return
         if not self._prepare_result_writer():
+            self._reset_controls()
             return
 
         self._save_last_state()
+        if not groups:
+            self._finish_resume_only()
+            return
         self._launch_pick_run(groups)
 
     def _launch_pick_run(self, groups: list[dict]):
         self.pick_groups = groups
-        self.pick_bill_results = []
-        self.all_records.clear()
+        self.pick_bill_results = list(self._resumed_bills)
+        self.all_records = list(self._resumed_records)
         # Bộ đếm cộng dồn theo id(worker); còn sót worker của lượt trước là số
         # liệu STATS bị thổi lên ngay từ dòng đầu tiên.
         self.worker_stats.clear()
@@ -1841,7 +1863,8 @@ class BotGUI(QMainWindow):
 
         unit = self._session_unit()
         total_serials = sum(len(g["rows"]) for g in groups)
-        self._current_run_total = total_serials
+        self._current_run_total = total_serials + len(self._resumed_records)
+        self._run_finished_monotonic = None
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat(f"0 / {len(groups)} {unit}")
         self._update_stats(0, 0, 0, 0, total_serials)
@@ -1867,6 +1890,7 @@ class BotGUI(QMainWindow):
 
         worker = PickWorker(
             groups, instance, config, screenshot_dir=SCREENSHOT_DIR, runner_cls=runner_cls,
+            journal=self.journal, run_id=self.run_id,
         )
         worker.progress.connect(self._on_pick_progress)
         worker.bill_started.connect(self._on_bill_started)
@@ -1878,7 +1902,7 @@ class BotGUI(QMainWindow):
         worker.result_ready.connect(self._on_result_ready)
         worker.bill_done.connect(self.pick_bill_results.append)
         worker.stopped.connect(self._on_pick_stopped)
-        worker.finished_all.connect(lambda w=worker: self._on_pick_finished(w))
+        worker.finished.connect(lambda w=worker: self._on_pick_finished(w))
 
         self.workers = [worker]
         self.is_paused = False
@@ -1947,12 +1971,6 @@ class BotGUI(QMainWindow):
         unit = self._session_unit()
         worker = self.workers[0] if self.workers else None
         done_bills = list(worker.done_bills) if worker else []
-        if done_bills:
-            save_session(
-                self.excel_path, done_rows=[], done=0, success=0, error=0, unknown=0,
-                done_bills=done_bills, mode=self.run_mode(),
-            )
-
         text = f"{message}\n\n"
         if done_bills:
             text += f"Đã xong {len(done_bills)} {unit}, chỗ dừng đã được ghi nhớ.\n\n"
@@ -1968,32 +1986,14 @@ class BotGUI(QMainWindow):
         QMessageBox.critical(self, "Phiên chạy đã dừng", text)
 
     def _on_pick_finished(self, worker):
-        self.workers = []
-        self.pick_box.setEnabled(True)
-        if self.result_writer:
-            try:
-                self.result_writer.finalize()
-            except Exception as e:                          # noqa: BLE001
-                # Kết quả nằm trong file nguồn nên hụt lúc lưu là mất trắng phiên
-                # này - im lặng thì người dùng đóng app rồi mới biết.
-                logger.exception("Could not save pick results into the source workbook")
-                QMessageBox.warning(
-                    self, "Chưa lưu được kết quả",
-                    f"{e}\n\nFile Excel nhiều khả năng đang mở - đóng nó rồi bấm "
-                    f"Stop để lưu lại sheet '{self.result_writer.sheet_name}'.",
-                )
-        self._reset_controls()
-        self.export_report_btn.setEnabled(bool(self.pick_bill_results))
-        if worker.done_bills and len(worker.done_bills) == len(self.pick_groups):
-            clear_session()
-            self._notify_finished(
-                f"Xong {len(worker.done_bills)} {self._session_unit()}."
-            )
+        self._on_all_finished()
+        if not self.result_writer:
+            self.pick_box.setEnabled(True)
 
     def _on_excel_loaded(self, raw):
         if not raw:
             QMessageBox.information(self, "No data", "No serials were found in the selected file.")
-            self.start_btn.setEnabled(True)
+            self._reset_controls()
             self.progress_bar.setFormat("0 / 0")
             return
 
@@ -2002,53 +2002,180 @@ class BotGUI(QMainWindow):
             for r in raw
         ]
 
-        session = load_session(self.excel_path)
-        if session and session.get("done_rows"):
-            reply = QMessageBox.question(
-                self,
-                "Resume previous run?",
-                f"Found an unfinished run for this file (updated {session.get('updated_at', '')}, "
-                f"{session.get('done', 0)} serial(s) already processed).\n\n"
-                "Continue from where it left off? (already-processed rows will be skipped)",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                done_rows = set(session["done_rows"])
-                full_items = [it for it in full_items if it.row not in done_rows]
-                self.session_done_rows = done_rows
-            else:
-                clear_session()
-                self.session_done_rows = set()
-        else:
-            self.session_done_rows = set()
-
+        self.session_done_rows = set()
         if not full_items:
             QMessageBox.information(self, "Nothing to do", "All rows in range were already processed.")
-            self.start_btn.setEnabled(True)
+            self._reset_controls()
             self.progress_bar.setFormat("0 / 0")
             return
 
         dialog = PreviewDialog(full_items, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
-            self.start_btn.setEnabled(True)
+            self._reset_controls()
             self.progress_bar.setFormat("0 / 0")
             return
 
         selected_items = dialog.selected_items()
         if not selected_items:
             QMessageBox.information(self, "Nothing selected", "No serials were selected to run.")
-            self.start_btn.setEnabled(True)
+            self._reset_controls()
             self.progress_bar.setFormat("0 / 0")
             return
 
         if self.dry_run_check.isChecked():
             selected_items = selected_items[:self.dry_run_count.value()]
 
+        selected_items = self._prepare_journal(selected_items, MODE_SERIAL)
+        if selected_items is None:
+            self._reset_controls()
+            return
         if not self._prepare_result_writer():
+            self._reset_controls()
             return
 
         self._save_last_state()
+        if not selected_items:
+            self._finish_resume_only()
+            return
         self._launch_run(selected_items)
+
+    def _finish_resume_only(self):
+        self.all_records = list(self._resumed_records)
+        self.pick_bill_results = list(self._resumed_bills)
+        self.workers = []
+        self._run_complete = True
+        self._finishing = True
+        self.start_btn.setEnabled(False)
+        self.tb_start.setEnabled(False)
+        self.result_writer.finalize()
+
+    def _prepare_journal(self, selected, mode):
+        """Match only the exact reviewed selection, never a path-only checkpoint."""
+        self._resumed_records = []
+        self._resumed_bills = []
+        self._stop_requested = False
+        if self.journal is None:
+            self.journal = RunJournal()
+        config = self._collect_profile_values()
+        config["instances"] = self._get_selected_instances()
+        config["recipe"] = [step.to_dict() for step in getattr(self, "active_recipe_steps", [])]
+        # UI preferences do not alter the business workload identity.
+        config = {k: v for k, v in config.items() if k not in ("theme",)}
+        rows = ([{"row": item.row, "value": item.value, "cells": item.cells} for item in selected]
+                if mode == MODE_SERIAL else selected)
+        sheet = self.sheet_combo.currentText().strip() or None
+        self._run_source_path = self.excel_path
+        self._run_sheet = sheet
+        key = fingerprint(self.excel_path, sheet, mode, rows, config)
+        previous = self.journal.latest(key)
+        other_pending = [op for op in self.journal.pending_for_source(self.excel_path)
+                         if not previous or op["run_id"] != previous["id"]]
+        if other_pending:
+            QMessageBox.warning(self, "Còn thao tác chưa đối chiếu",
+                "Dữ liệu hoặc cấu hình đã đổi nhưng file này còn thao tác chưa rõ kết quả từ lượt trước.\n"
+                "Bấm 'Đối chiếu tiến độ', kiểm tra trạng thái trên app trước khi chạy dữ liệu mới.")
+            return None
+        import json
+        if previous and (previous["state"] != "complete" or not previous["excel_saved"]):
+            pending = self.journal.pending(previous["id"])
+            if pending:
+                details = "\n".join(f"{op['kind']}: dòng {op['row'] or '-'}, mã {op['bill'] or '-'}" for op in pending[:12])
+                answer = QMessageBox.warning(self, "Cần đối chiếu thao tác chưa rõ kết quả",
+                    "Có thao tác đã bắt đầu nhưng chưa xác nhận xong.\n" + details +
+                    "\n\nKiểm tra và xử lý phiên dở trên app trước. Chọn Yes chỉ khi đã đối chiếu; "
+                    "bot sẽ BỎ các dòng/mã đang dở, ghi chưa xác minh và tiếp tục phần chưa chạy. "
+                    "Chọn Cancel để giữ nguyên và kiểm tra.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel)
+                if answer != QMessageBox.StandardButton.Yes:
+                    return None
+                pending_bills = {op["bill"] for op in pending if op["bill"]}
+                pending_rows = {op["row"] for op in pending if op["row"] is not None}
+                known = {r["row"] for r in self.journal.results(previous["id"])}
+                for group in (selected if mode != MODE_SERIAL else []):
+                    if group["bill"] in pending_bills:
+                        for row in group["rows"]:
+                            if row["row"] not in known:
+                                self.journal.record_result(previous["id"], {
+                                    "row": row["row"], "serial": row["value"], "bill": group["bill"],
+                                    "status": "UNKNOWN", "verification": UNVERIFIED,
+                                    "message": "Đã đối chiếu thủ công; bỏ phiên đang dở", "response_text": "",
+                                    "screenshot_path": None, "reason": "", "time": ""})
+                        self.journal.complete_bill(previous["id"], {
+                            "bill": group["bill"], "ref": group.get("ref", ""), "expected": len(group["rows"]),
+                            "picked": sum(r["status"] == "OK" and r.get("verification") == CONFIRMED
+                                          for r in self.journal.results(previous["id"]) if r.get("bill") == group["bill"]),
+                            "status": "UNKNOWN", "message": "Phiên đã đối chiếu thủ công"})
+                for item in (selected if mode == MODE_SERIAL else []):
+                    if item.row in pending_rows:
+                        self.journal.record_result(previous["id"], {
+                            "row": item.row, "serial": item.value, "status": "UNKNOWN", "verification": UNVERIFIED,
+                            "message": "Đã đối chiếu thủ công; bỏ thao tác chưa rõ", "response_text": "",
+                            "screenshot_path": None, "reason": "", "time": ""})
+                for operation in pending:
+                    self.journal.resolve(operation["id"], "reviewed")
+                answer = QMessageBox.StandardButton.Yes
+            else:
+                answer = QMessageBox.question(self, "Tiếp tục lượt trước?",
+                    "Có tiến độ đã lưu cho đúng dữ liệu và cấu hình này.\n"
+                    "Yes: bỏ phần đã xử lý và tiếp tục. No: bắt đầu một lượt mới.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Yes)
+            if answer == QMessageBox.StandardButton.Cancel:
+                return None
+            if answer == QMessageBox.StandardButton.Yes:
+                self.run_id = previous["id"]
+                self._resumed_records = self.journal.results(self.run_id)
+                self._resumed_bills = self.journal.bills(self.run_id)
+                self._result_sheet = json.loads(previous["metadata"])["result_sheet"]
+                self.journal.set_state(self.run_id, "running")
+                if mode == MODE_SERIAL:
+                    done = {r["row"] for r in self._resumed_records}
+                    return [item for item in selected if item.row not in done]
+                done = {b["bill"] for b in self._resumed_bills}
+                return [g for g in selected if g["bill"] not in done]
+        legacy = load_session(self.excel_path)
+        if legacy and not previous:
+            QMessageBox.information(self, "Checkpoint cũ", "Checkpoint cũ chỉ khớp đường dẫn file. "
+                                    "Bot không tự bỏ dòng; kiểm tra danh sách xem trước trước khi chạy.")
+        import uuid
+        self._result_sheet = f"Ket qua {datetime.now():%y%m%d_%H%M%S}_{uuid.uuid4().hex[:4]}"
+        self.run_id = self.journal.create_run(key, self.excel_path, mode,
+            {"sheet": sheet, "config": config, "selected": rows, "result_sheet": self._result_sheet})
+        logger.info("Run metadata: run_id=%s version=%s mode=%s instances=%s config=%s",
+                    self.run_id, APP_VERSION, mode, self._get_selected_instances(), config)
+        return selected
+
+    def _review_unresolved_progress(self):
+        if any(w.isRunning() for w in self.workers) or self._finishing or not self.excel_path:
+            return
+        if self.journal is None:
+            self.journal = RunJournal()
+        pending = self.journal.pending_for_source(self.excel_path)
+        if not pending:
+            QMessageBox.information(self, "Tiến độ", "Không có thao tác đang chờ đối chiếu cho file này.")
+            return
+        import json
+        details = "\n".join(f"Dòng {op['row'] or '-'} / {op['bill'] or '-'}: {op['kind']} {op['payload']}"
+                            for op in pending[:15])
+        answer = QMessageBox.warning(self, "Đối chiếu trên app",
+            details + "\n\nKiểm tra kết quả trên app, hoàn tất hoặc đóng phiên dở. "
+            "Chỉ chọn Yes nếu đã đối chiếu toàn bộ thao tác này và chấp nhận chạy lại dữ liệu được chọn ở lượt mới. "
+            "Bot sẽ ghi thao tác cũ là chưa xác minh, không tự biến thành thành công.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        for operation in pending:
+            if operation["row"] is not None:
+                payload = json.loads(operation["payload"])
+                records = {r["row"]: r for r in self.journal.results(operation["run_id"])}
+                old = records.get(operation["row"], {})
+                self.journal.record_result(operation["run_id"], {
+                    **old, "row": operation["row"], "serial": old.get("serial", payload.get("serial", "")),
+                    "status": "UNKNOWN", "verification": UNVERIFIED,
+                    "message": "Đã đối chiếu thủ công; kết quả tự động chưa xác minh"})
+            self.journal.resolve(operation["id"], "reviewed")
 
     def _prepare_result_writer(self) -> bool:
         """
@@ -2077,17 +2204,16 @@ class BotGUI(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return False
 
-        try:
-            self.result_writer = ResultWriter(self.excel_path, data_sheet=sheet)
-        except Exception as e:                              # noqa: BLE001
-            logger.exception("Could not add a result sheet to the source workbook")
-            QMessageBox.warning(
-                self, "Không ghi được kết quả vào file Excel",
-                f"{e}\n\nFile có thể đang mở trong Excel - đóng nó rồi chạy lại "
-                f"thì kết quả mới được ghi.\n\n"
-                f"Phiên chạy vẫn tiếp tục nhưng không ghi ngược vào Excel.",
-            )
-            self.result_writer = None
+        if self.result_writer and self.result_writer.isRunning():
+            QMessageBox.information(self, "Đang lưu", "Chờ tác vụ lưu Excel kết thúc trước khi chạy mới.")
+            return False
+        self.result_writer = ResultWriterWorker(self.excel_path, data_sheet=sheet,
+                                               result_sheet=self._result_sheet, run_id=self.run_id)
+        self.result_writer.save_status.connect(self._on_excel_save_status)
+        self.result_writer.finished.connect(self._on_writer_finished)
+        self.result_writer.start()
+        for record in self._resumed_records:
+            self.result_writer.add_record(record)
         return True
 
     def _preflight_browser_check(self) -> bool:
@@ -2154,13 +2280,17 @@ class BotGUI(QMainWindow):
         return False
 
     def _on_excel_load_error(self, err_msg):
-        self.start_btn.setEnabled(True)
+        self._reset_controls()
         self.progress_bar.setFormat("0 / 0")
         QMessageBox.critical(self, "Excel read error", err_msg)
 
     def _launch_run(self, serial_items: list[SerialItem]):
+        self._stop_requested = False
+        self._finishing = False
         self.serials_cache = serial_items
-        self._current_run_total = len(serial_items)
+        self.all_records = list(self._resumed_records)
+        self._current_run_total = len(serial_items) + len(self._resumed_records)
+        self._run_finished_monotonic = None
         self.log_list.clear()
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat(f"0 / {len(serial_items)}")
@@ -2206,6 +2336,7 @@ class BotGUI(QMainWindow):
                 recipe_steps=getattr(self, "active_recipe_steps", None),
                 recipe_name=self.recipe_combo.currentText()
                 if self.recipe_combo.currentData() else "",
+                journal=self.journal, run_id=self.run_id,
                 run_target=target,
                 browser_port=self.browser_port_input.value(),
                 browser_url=self.browser_url_input.text().strip(),
@@ -2214,7 +2345,7 @@ class BotGUI(QMainWindow):
             worker.log_entry.connect(self._on_log_entry)
             worker.result_ready.connect(self._on_result_ready)
             worker.stats_update.connect(lambda d, s, e, u, w=worker: self._on_worker_stats(w, d, s, e, u))
-            worker.finished_all.connect(lambda w=worker: self._on_worker_finished(w))
+            worker.finished.connect(lambda w=worker: self._on_worker_finished(w))
             worker.error_occurred.connect(self._on_error)
             worker.backend_info.connect(self._on_backend_info)
 
@@ -2292,8 +2423,12 @@ class BotGUI(QMainWindow):
         trống thì lấy số liệu ở khung STATS như cũ.
         """
         self.start_btn.setEnabled(False)
+        self.tb_start.setEnabled(False)
         self.pause_btn.setEnabled(False)
-        self.stop_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.tb_stop.setEnabled(True)
+        self.pages.widget(1).setEnabled(False)
+        self.pages.widget(2).setEnabled(False)
 
         self._countdown_val = 3
         self._countdown_final_format = final_format
@@ -2320,13 +2455,31 @@ class BotGUI(QMainWindow):
             callback()
 
     def _on_stop(self):
+        if getattr(self, "_timer", None) and self._timer.isActive():
+            self._timer.stop()
+            self._stop_requested = True
+            for worker in self.workers:
+                worker.stop()
+            if not any(worker.isRunning() for worker in self.workers):
+                self._on_all_finished()
+                return
+        if not any(worker.isRunning() for worker in self.workers):
+            self._retry_excel_save()
+            return
+        self._stop_requested = True
+        self.start_btn.setEnabled(False)
+        self.tb_start.setEnabled(False)
+        self.pause_btn.setEnabled(False)
+        self.tb_pause.setEnabled(False)
+        self.status_progress.setText("Đang dừng...")
         for worker in self.workers:
             worker.stop()
-        if self.result_writer:
-            self.result_writer.save()
-        self._reset_controls()
 
     def _on_retry_errors(self):
+        if self.run_mode() != MODE_SERIAL:
+            QMessageBox.information(self, "Chạy lại theo phiên", "Chọn lại mã OR/check-in trong lượt mới "
+                                    "sau khi đối chiếu trạng thái phiên trên app.")
+            return
         error_items = [
             SerialItem(row=r["row"], value=r["serial"])
             for r in self.all_records
@@ -2336,6 +2489,12 @@ class BotGUI(QMainWindow):
             QMessageBox.information(self, "No errors", "There are no error rows to retry.")
             return
         self.retry_errors_btn.setEnabled(False)
+        error_items = self._prepare_journal(error_items, MODE_SERIAL)
+        if error_items is None or not self._prepare_result_writer():
+            return
+        if not error_items:
+            self._finish_resume_only()
+            return
         self._launch_run(error_items)
 
     # ---------------------------------------------------------------- signal handlers
@@ -2352,15 +2511,18 @@ class BotGUI(QMainWindow):
 
     def _update_aggregate_progress(self):
         total_done = sum(s[0] for s in self.worker_stats.values()) if self.worker_stats else 0
+        newly_done = total_done
+        total_done += len(self._resumed_records)
         total = self._current_run_total
         pct = int(total_done / total * 100) if total else 0
         self.progress_bar.setValue(pct)
 
         eta_text = ""
-        if self._run_start_monotonic and total_done > 0:
-            elapsed = time.monotonic() - self._run_start_monotonic
+        if self._run_start_monotonic and newly_done > 0:
+            elapsed = time.monotonic() - self._run_start_monotonic - max(
+                (getattr(w, "pause_seconds", 0) for w in self.workers), default=0)
             if elapsed > 0:
-                rate_per_min = total_done / elapsed * 60
+                rate_per_min = newly_done / elapsed * 60
                 remaining = total - total_done
                 eta_min = remaining / rate_per_min if rate_per_min > 0 else 0
                 eta_text = f" | {rate_per_min:.0f}/min | ETA {eta_min:.0f}m"
@@ -2413,44 +2575,25 @@ class BotGUI(QMainWindow):
                 return
 
     def _on_result_ready(self, result: dict):
-        self.all_records.append(result)
-        if result.get("reason") == REASON_NOT_FOUND:
-            self.stat_not_found_lbl.setText(
-                str(sum(1 for r in self.all_records if r.get("reason") == REASON_NOT_FOUND))
-            )
-        if self.result_writer:
-            try:
-                self.result_writer.add_result(
-                    result["row"],
-                    result.get("serial", ""),
-                    result["status"],
-                    result["response_text"],
-                    result["screenshot_path"],
-                    result.get("reason", ""),
-                )
-                for column, value in (result.get("cell_writes") or {}).items():
-                    self.result_writer.add_cell(result["row"], column, value)
-            except Exception:
-                logger.exception("Failed to write result row %s to Excel", result["row"])
-
+        result.setdefault("verification", UNVERIFIED)
+        existing = next((i for i, record in enumerate(self.all_records) if record["row"] == result["row"]), None)
+        if existing is None:
+            self.all_records.append(result)
+        else:
+            self.all_records[existing] = result
+        # Workers commit before emitting this signal; the GUI only displays
+        # and queues the Excel export, avoiding a second synchronous commit.
+        if self.result_writer and self.result_writer.isRunning():
+            self.result_writer.add_record(result)
         self.session_done_rows.add(result["row"])
-        if len(self.session_done_rows) % SESSION_SAVE_EVERY == 0:
-            self._save_session_snapshot()
+        self.stat_not_found_lbl.setText(str(sum(r.get("reason") == REASON_NOT_FOUND for r in self.all_records)))
+        self.stat_inferred_lbl.setText(str(sum(r.get("status") == "OK" and r.get("verification") == INFERRED
+                                             for r in self.all_records)))
 
     def _save_session_snapshot(self):
-        if not self.excel_path:
-            return
-        success = sum(1 for r in self.all_records if r["status"] == "OK")
-        error = sum(1 for r in self.all_records if r["status"] == "ERROR")
-        unknown = sum(1 for r in self.all_records if r["status"] == "UNKNOWN")
-        save_session(
-            self.excel_path,
-            list(self.session_done_rows),
-            len(self.all_records),
-            success,
-            error,
-            unknown,
-        )
+        # Results and operation intentions are committed by the workers.
+        if self.journal and self.run_id:
+            self.journal.set_state(self.run_id, "stopped" if self._stop_requested else "running")
 
     def _on_worker_stats(self, worker, done, success, error, unknown):
         self.worker_stats[id(worker)] = (done, success, error, unknown)
@@ -2458,10 +2601,16 @@ class BotGUI(QMainWindow):
         total_success = sum(s[1] for s in self.worker_stats.values())
         total_error = sum(s[2] for s in self.worker_stats.values())
         total_unknown = sum(s[3] for s in self.worker_stats.values())
+        total_done += len(self._resumed_records)
+        total_success += sum(r["status"] == "OK" and r.get("verification") == CONFIRMED for r in self._resumed_records)
+        total_error += sum(r["status"] == "ERROR" for r in self._resumed_records)
+        total_unknown += sum(r["status"] == "UNKNOWN" for r in self._resumed_records)
         self._update_stats(total_done, total_success, total_error, total_unknown, self._current_run_total)
         self._update_aggregate_progress()
 
     def _on_export_report(self):
+        if self.report_writer and self.report_writer.isRunning():
+            return
         if not self.all_records:
             QMessageBox.information(self, "No data", "There are no records to export yet.")
             return
@@ -2474,30 +2623,36 @@ class BotGUI(QMainWindow):
         if not path.lower().endswith(".xlsx"):
             path += ".xlsx"
 
-        summary = self._build_summary()
-        try:
-            if self.pick_bill_results:
-                # Chế độ chạy theo phiên: thêm sheet theo phiên, vì phiên làm
-                # thiếu nghĩa là còn một phiên đang mở trên máy ảo - nhìn theo
-                # serial không thấy được điều đó.
-                inbound = self.run_mode() == MODE_INBOUND
-                write_pick_report(
-                    path, self.pick_bill_results, self.all_records, summary,
-                    bills_sheet="Check-in" if inbound else "Ma OR",
-                    bill_header="Ma check-in" if inbound else "Ma OR",
-                    ref_header="Ma van don (MVD)",
-                )
-            else:
-                write_report(path, self.all_records, summary)
-        except Exception as e:
-            QMessageBox.critical(self, "Export failed", f"Could not export report:\n{e}")
+        if os.path.normcase(os.path.abspath(path)) in {
+                os.path.normcase(os.path.abspath(p)) for p in (self.excel_path, self._run_source_path) if p}:
+            QMessageBox.warning(self, "Xuất báo cáo", "Chọn file báo cáo riêng để giữ nguyên workbook nguồn và kết quả.")
             return
+        self.report_writer = ReportWriterWorker(path, self.all_records, self._build_summary(),
+                                               self.pick_bill_results, self.run_mode() == MODE_INBOUND)
+        self.report_writer.finished.connect(self._on_report_finished)
+        self.export_report_btn.setEnabled(False)
+        self.start_btn.setEnabled(False)
+        self.tb_start.setEnabled(False)
+        self.report_writer.start()
 
-        QMessageBox.information(self, "Export complete", f"Exported {len(self.all_records)} record(s) to:\n{path}")
+    def _on_report_finished(self):
+        writer = self.report_writer
+        self.export_report_btn.setEnabled(bool(self.all_records))
+        if not any(w.isRunning() for w in self.workers) and not (
+                self.result_writer and self.result_writer.isRunning()):
+            if self._finishing:
+                self._finish_controls()
+            else:
+                self.start_btn.setEnabled(True)
+                self.tb_start.setEnabled(True)
+        if writer.error:
+            QMessageBox.critical(self, "Export failed", f"Could not export report:\n{writer.error}")
+        else:
+            QMessageBox.information(self, "Export complete", f"Exported {len(writer.records)} record(s) to:\n{writer.path}")
 
     def _build_summary(self) -> dict:
         done = len(self.all_records)
-        success = sum(1 for r in self.all_records if r["status"] == "OK")
+        success = sum(1 for r in self.all_records if r["status"] == "OK" and r.get("verification") == CONFIRMED)
         error = sum(1 for r in self.all_records if r["status"] == "ERROR")
         unknown = sum(1 for r in self.all_records if r["status"] == "UNKNOWN")
 
@@ -2508,13 +2663,20 @@ class BotGUI(QMainWindow):
             started = datetime.strptime(self.run_started_at, "%Y-%m-%d %H:%M:%S")
             finished = datetime.strptime(finished_at, "%Y-%m-%d %H:%M:%S")
             elapsed_seconds = max(0, int((finished - started).total_seconds()))
+            if self._run_start_monotonic:
+                finish_tick = self._run_finished_monotonic or time.monotonic()
+                paused = max((getattr(w, "pause_seconds", 0.0) for w in self.workers), default=0.0)
+                elapsed_seconds = max(0, round(finish_tick - self._run_start_monotonic - paused, 2))
             if elapsed_seconds > 0:
                 rate_per_min = round(done / elapsed_seconds * 60, 1)
 
         return {
-            "total": len(self.serials_cache),
+            "total": self._current_run_total,
             "done": done,
             "success": success,
+            "confirmed": success,
+            "inferred": sum(r["status"] == "OK" and r.get("verification") == INFERRED for r in self.all_records),
+            "unverified": sum(r.get("verification", UNVERIFIED) == UNVERIFIED for r in self.all_records),
             "error": error,
             "not_found": sum(
                 1 for r in self.all_records if r.get("reason") == REASON_NOT_FOUND
@@ -2539,30 +2701,74 @@ class BotGUI(QMainWindow):
         self._on_all_finished()
 
     def _on_all_finished(self):
+        self._run_finished_monotonic = time.monotonic()
+        self._finishing = True
+        self.start_btn.setEnabled(False)
+        self.tb_start.setEnabled(False)
+        self.status_progress.setText("Đang lưu kết quả...")
+        self._run_complete = bool(self.workers) and all(getattr(w, "completion_state", "failed") == "complete"
+                                                       for w in self.workers)
+        if self.journal and self.run_id and self.journal.pending(self.run_id):
+            self._run_complete = False
+        if self.journal and self.run_id:
+            self.journal.set_state(self.run_id, "complete" if self._run_complete else "stopped")
+        if self.result_writer and self.result_writer.isRunning():
+            self.result_writer.finalize()
+        else:
+            self._finish_controls()
+
+    def _on_excel_save_status(self, saved, message):
+        if self.sender() is not None and self.sender() is not self.result_writer:
+            return
+        self.status_progress.setText(message)
+        if self.journal and self.run_id:
+            # Only final flush marks the run export complete. New results may
+            # already be in flight when a periodic-save signal reaches the UI.
+            if not saved:
+                self.journal.set_state(self.run_id, "complete" if getattr(self, "_run_complete", False) else "running",
+                                       excel_saved=False)
+
+    def _on_writer_finished(self):
+        if self.sender() is not None and self.sender() is not self.result_writer:
+            return
+        if self.journal and self.run_id and self._finishing:
+            self.journal.set_state(self.run_id, "complete" if getattr(self, "_run_complete", False) else "stopped",
+                                   excel_saved=bool(self.result_writer and self.result_writer.saved))
+        if self._finishing and not any(w.isRunning() for w in self.workers):
+            self._finish_controls()
+
+    def _finish_controls(self):
+        if self.report_writer and self.report_writer.isRunning():
+            self.status_progress.setText("Đang xuất báo cáo...")
+            return
+        self._finishing = False
         self._reset_controls()
-        clear_session()
-        self.session_done_rows = set()
+        self.pick_box.setEnabled(True)
+        self.retry_errors_btn.setEnabled(any(r["status"] == "ERROR" for r in self.all_records))
+        self.export_report_btn.setEnabled(bool(self.all_records))
+        saved = bool(self.result_writer and self.result_writer.saved)
+        # Stop doubles as retry-save only after the run ended.
+        self.stop_btn.setEnabled(not saved and bool(self.all_records))
+        self.tb_stop.setEnabled(not saved and bool(self.all_records))
+        self.stop_btn.setText("Stop" if saved else "Lưu lại Excel")
+        self._set_tray_state("idle" if saved else "error")
+        text = "Đã hoàn tất lượt chạy" if getattr(self, "_run_complete", False) else "Đã dừng; tiến độ được giữ để tiếp tục"
+        self._notify_finished(text)
 
-        error_count = sum(1 for r in self.all_records if r["status"] == "ERROR")
-        self.retry_errors_btn.setEnabled(error_count > 0)
-
-        message = "Finished processing all serials."
-        if self.result_writer:
-            try:
-                self.result_writer.finalize()
-                message += (
-                    f"\n\nKết quả đã ghi vào sheet '{self.result_writer.sheet_name}' "
-                    f"trong chính file nguồn:\n{self.result_writer.path}"
-                )
-            except Exception as e:
-                message += (
-                    f"\n\n(Chưa lưu được kết quả: {e}\n"
-                    f"File đang mở trong Excel thì đóng lại rồi bấm Stop để lưu.)"
-                )
-
-        self._set_tray_state("idle")
-        self._notify_finished(message.splitlines()[0])
-        QMessageBox.information(self, "Done", message)
+    def _retry_excel_save(self):
+        if not self.all_records or (self.result_writer and self.result_writer.isRunning()):
+            return
+        self._finishing = True
+        self.start_btn.setEnabled(False)
+        self.tb_start.setEnabled(False)
+        self.result_writer = ResultWriterWorker(self._run_source_path or self.excel_path,
+            self._run_sheet, self._result_sheet, run_id=self.run_id)
+        self.result_writer.save_status.connect(self._on_excel_save_status)
+        self.result_writer.finished.connect(self._on_writer_finished)
+        self.result_writer.start()
+        for record in self.all_records:
+            self.result_writer.add_record(record)
+        self.result_writer.finalize()
 
     def _on_error(self, message):
         self._set_tray_state("error")
@@ -2571,18 +2777,24 @@ class BotGUI(QMainWindow):
             self.tray_icon.showMessage(
                 APP_NAME, message, QSystemTrayIcon.MessageIcon.Warning, 8000
             )
+        uncertain = any(getattr(worker, "completion_state", "") == "uncertain" for worker in self.workers)
+        if not uncertain:
+            for worker in self.workers:
+                worker.pause()
         QMessageBox.warning(
             self,
             "Automation error",
-            f"{message}\nBot paused. Please check LDPlayer and press Resume.",
+            message if uncertain else f"{message}\nBot paused. Please check LDPlayer and press Resume.",
         )
-        for worker in self.workers:
-            worker.pause()
+        if uncertain:
+            return
         self.pause_btn.setText("Resume")
         self.tb_pause.setText("Tiếp tục")
         self.is_paused = True
 
     def _reset_controls(self):
+        self.pages.widget(1).setEnabled(True)
+        self.pages.widget(2).setEnabled(True)
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
@@ -2595,6 +2807,8 @@ class BotGUI(QMainWindow):
         self.tb_stop.setEnabled(False)
 
     def closeEvent(self, event):
+        if getattr(self, "_timer", None) and self._timer.isActive():
+            self._on_stop()
         running = any(w.isRunning() for w in self.workers)
 
         # While a run is in progress the X button tucks the app into the tray
@@ -2626,15 +2840,29 @@ class BotGUI(QMainWindow):
                 worker.stop()
             for worker in self.workers:
                 worker.wait(5000)
+            if any(worker.isRunning() for worker in self.workers):
+                self.status_progress.setText("Đang dừng; chờ worker kết thúc trước khi đóng.")
+                event.ignore()
+                return
 
         if self.loader_thread and self.loader_thread.isRunning():
             self.loader_thread.wait(3000)
 
-        if self.result_writer:
-            try:
-                self.result_writer.save()
-            except Exception:
-                logger.exception("Failed to save results on close")
+        if self.loader_thread and self.loader_thread.isRunning():
+            event.ignore()
+            return
+        if self.result_writer and self.result_writer.isRunning():
+            self.result_writer.finalize()
+            event.ignore()
+            self.status_progress.setText("Đang lưu Excel; đóng lại sau khi lưu xong.")
+            return
+        if self.report_writer and self.report_writer.isRunning():
+            event.ignore()
+            self.status_progress.setText("Đang chờ xuất báo cáo xong...")
+            return
+        if self.journal:
+            self.journal.close()
+            self.journal = None
 
         self._save_last_state()
         self._save_geometry()

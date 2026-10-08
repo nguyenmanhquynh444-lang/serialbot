@@ -1,11 +1,18 @@
 import os
 import subprocess
 import sys
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import automation_backend
 from automation_backend import AdbClient, shell_quote
+
+
+@pytest.fixture(autouse=True)
+def known_instance_mapping(monkeypatch):
+    monkeypatch.setattr(automation_backend, "list_ldplayer_instances",
+                        lambda **kwargs: [{"index": "0", "name": "LDPlayer", "running": True}])
 
 
 def test_shell_quote_plain_value():
@@ -90,7 +97,7 @@ def test_several_devices_are_told_apart_by_instance_index(monkeypatch):
     fake = _FakeRun(TWO_DEVICES)
     monkeypatch.setattr(
         automation_backend, "list_ldplayer_instances",
-        lambda: [{"index": "0", "name": "LDPlayer", "running": True},
+        lambda **kwargs: [{"index": "0", "name": "LDPlayer", "running": True},
                  {"index": "1", "name": "LDPlayer-1", "running": True}],
     )
 
@@ -111,7 +118,7 @@ def test_unknown_instance_name_falls_back_to_ldconsole(monkeypatch):
     fake = _FakeRun(TWO_DEVICES)
     monkeypatch.setattr(
         automation_backend, "list_ldplayer_instances",
-        lambda: [{"index": "0", "name": "May chinh", "running": True}],
+        lambda **kwargs: [{"index": "0", "name": "May chinh", "running": True}],
     )
 
     client = _client(monkeypatch, fake)
@@ -139,10 +146,33 @@ def test_empty_device_list_is_retried_not_remembered(monkeypatch):
     assert fake.calls[-1] == [r"C:\fake\adb.exe", "-s", "emulator-5554", "shell", "true"]
 
 
-def test_direct_failure_falls_back_to_ldconsole(monkeypatch):
+def test_direct_failure_does_not_resend_through_ldconsole(monkeypatch):
     fake = _FakeRun(ONE_DEVICE, rc=1, stdout="")
     client = _client(monkeypatch, fake)
 
-    client.run_shell("true")
+    assert client.run_shell("input text 'S1'") is None
 
-    assert "ldconsole.exe" in fake.programs()
+    assert "ldconsole.exe" not in fake.programs()
+
+
+def test_timeout_after_delivery_never_replays_command(monkeypatch):
+    fake = _FakeRun(ONE_DEVICE)
+    def lost_reply(cmd, **kwargs):
+        if "shell" in cmd:
+            fake.calls.append(cmd)
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+        return fake(cmd, **kwargs)
+    client = _client(monkeypatch, lost_reply)
+    assert client.run_shell("input text 'S1'") is None
+    assert sum("shell" in command for command in fake.calls) == 1
+    assert "ldconsole.exe" not in fake.programs()
+
+
+def test_single_connected_device_is_not_assumed_to_be_selected_instance(monkeypatch):
+    fake = _FakeRun(ONE_DEVICE)
+    client = _client(monkeypatch, fake)
+    monkeypatch.setattr(automation_backend, "list_ldplayer_instances",
+                        lambda **kwargs: [{"index": "1", "name": "LDPlayer", "running": True}])
+    assert client.run_shell("true") == "ok"
+    assert fake.calls[-1][0] == r"C:\fake\ldconsole.exe"
+    assert not any("shell" in command for command in fake.calls)

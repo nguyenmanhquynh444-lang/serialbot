@@ -31,15 +31,21 @@ import logging
 import os
 import re
 import time
+from functools import wraps
 from dataclasses import dataclass, field
 from datetime import datetime
+from automation_backend import AdbUnavailableError
+from verification import CONFIRMED, classify_session_dialog
+from telemetry import measure
 
 from screen_reader import (
     ScreenReader,
     dialog_message,
     find_dismiss_button,
     list_nodes,
+    nodes_by_id,
     normalize_match_text,
+    adb_budget,
 )
 
 logger = logging.getLogger(__name__)
@@ -83,6 +89,22 @@ POLL_INTERVAL = 0.05
 DEFAULT_TOTE = "T001"
 DEFAULT_BIN_CODE = "PYTES"
 _COUNTER_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+
+def bounded_step(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        previous = getattr(self, "_step_context", None)
+        previous_deadline = getattr(self, "_active_deadline", None)
+        self._step_context = (method.__name__, args)
+        deadline = time.monotonic() + self.config.step_timeout
+        self._active_deadline = min(previous_deadline, deadline) if previous_deadline is not None else deadline
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._step_context = previous
+            self._active_deadline = previous_deadline
+    return wrapped
 
 
 class PickStopped(Exception):
@@ -134,6 +156,7 @@ class SerialResult:
     serial: str
     status: str = "OK"
     message: str = ""
+    verification: str = CONFIRMED
 
 
 @dataclass
@@ -160,13 +183,7 @@ def parse_counter(text: str) -> tuple[int, int] | None:
 
 def nodes_with_id(screen_xml: str, resource_id: str) -> list[dict]:
     """Mọi phần tử mang resource-id này (khớp phần đuôi sau dấu '/')."""
-    wanted = resource_id.strip()
-    found = []
-    for node in list_nodes(screen_xml, only_interesting=False):
-        rid = node.get("resource_id", "")
-        if rid == wanted or rid.endswith("/" + wanted):
-            found.append(node)
-    return found
+    return nodes_by_id(screen_xml, resource_id)
 
 
 def first_with_id(screen_xml: str, resource_id: str) -> dict | None:
@@ -191,6 +208,8 @@ class PickRunner:
         on_log=None,
         should_stop=None,
         wait_if_paused=None,
+        journal=None,
+        run_id=None,
     ):
         self.adb = adb_client
         # Đã thử `--compressed`: đo trên máy thật 1.46s -> 1.44s, tức là không
@@ -204,6 +223,7 @@ class PickRunner:
         self.screenshot_dir = screenshot_dir
         self._on_log = on_log
         self._should_stop = should_stop or (lambda: False)
+        self.adb.should_stop = self._should_stop
         # Chỉ gọi ở chỗ không có đồng hồ đếm ngược nào đang chạy - xem
         # PickWorker._wait_if_paused.
         self._wait_if_paused = wait_if_paused or (lambda: None)
@@ -215,6 +235,68 @@ class PickRunner:
         # Màn hình tìm mã OR mà `_finish_session` vừa xác nhận, để mã kế tiếp
         # khỏi dump lại hỏi đúng câu đó. Chỉ dùng đúng một lần.
         self._at_search_xml = ""
+        self._scan_xml = ""
+        self._counter_total = None
+        self._completion_seen = False
+        self.journal = journal
+        self.run_id = run_id
+        self.session_mode = "pick"
+        self._bill = ""
+        self._last_observed_xml = ""
+        self.input_seconds = 0.0
+        self.wait_seconds = 0.0
+        self.retry_count = 0
+
+    def _check_wait(self, deadline):
+        if self._should_stop():
+            raise PickStopped("Người dùng bấm Dừng.")
+        if time.monotonic() >= deadline:
+            method, args = getattr(self, "_step_context", None) or ("", ())
+            xml = self._last_observed_xml
+            detail = self._describe(xml)
+            message = "Chờ quá thời gian cho phép; phiên chưa được xác minh hoàn tất."
+            if method == "_search_and_open":
+                wanted = normalize_match_text(args[0])
+                typed = self._search_field_text(xml)
+                cards = nodes_with_id(xml, RID_PROCEED)
+                if self.session_mode == "inbound":
+                    count = len(nodes_with_id(xml, "btnStart"))
+                    message = (f"Mã '{args[0]}' lọc ra {count} phiếu - không dám bấm." if count else
+                               f"Không tìm thấy phiếu check-in '{args[0]}'.")
+                elif typed and typed != wanted:
+                    message = f"Ô tìm kiếm đang là '{typed}' chứ không phải '{args[0]}' - không dám bấm."
+                elif not cards and typed == wanted and self._fresh_empty_result(xml) and not self._search_loading(xml):
+                    raise self._not_found(f"Không tìm thấy mã OR '{args[0]}' (app đã trả kết quả rỗng).")
+                elif cards:
+                    message = f"Mã OR '{args[0]}' lọc ra {len(cards)} phiên chưa xác minh đúng mã - không dám bấm."
+                else:
+                    message = f"Không tìm thấy mã OR '{args[0]}' nhưng chưa xác nhận truy vấn đã hoàn tất."
+            elif method == "_wait_for_scan_screen":
+                message = "Bấm Nhận hàng xong nhưng không thấy màn hình quét serial."
+            elif method == "_open_checkin_list":
+                message = "Không về được danh sách check-in."
+            elif method == "_open_picking_list":
+                message = "Không về được màn hình tìm mã OR."
+            elif method == "_finish_session":
+                message = "Quét đủ serial nhưng không về được " + ("danh sách check-in." if self.session_mode == "inbound"
+                                                                  else "màn hình tìm mã OR.")
+            raise self._stop(message + "\nMàn hình đang hiện: " + detail)
+
+    def _begin_operation(self, kind, row=None, payload=None):
+        if self.journal and self.run_id:
+            return self.journal.begin(self.run_id, kind, row=row, bill=self._bill, payload=payload)
+        return None
+
+    def _record_scan(self, result, operation):
+        if self.journal and self.run_id:
+            self.journal.record_result(self.run_id, {
+                "row": result.row, "serial": result.serial, "bill": self._bill,
+                "status": result.status, "verification": result.verification,
+                "message": result.message or "Đã xác nhận quét",
+                "response_text": result.message or "Đã xác nhận quét",
+                "screenshot_path": None, "reason": "",
+                "time": datetime.now().strftime("%H:%M:%S"),
+            }, operation)
 
     # ------------------------------------------------------------- tiện ích
 
@@ -223,13 +305,32 @@ class PickRunner:
         if self._on_log:
             self._on_log(text)
 
-    def _dump(self) -> str:
-        xml = self.screen.dump_xml()
-        if not xml:
-            raise PickStopped(
-                "Không đọc được màn hình máy ảo qua ADB. Kiểm tra LDPlayer còn chạy không."
-            )
-        return xml
+    def _poll(self, seconds=POLL_INTERVAL):
+        deadline = getattr(self, "_active_deadline", None)
+        if deadline is not None:
+            self._check_wait(deadline)
+            seconds = min(seconds, max(0.0, deadline-time.monotonic()))
+        started = time.monotonic()
+        time.sleep(seconds)
+        self.wait_seconds += time.monotonic()-started
+
+    def _dump(self, deadline=None) -> str:
+        deadline = deadline if deadline is not None else time.monotonic() + self.config.step_timeout
+        if getattr(self, "_active_deadline", None) is not None:
+            deadline = min(deadline, self._active_deadline)
+        for attempt in range(3):
+            self._check_wait(deadline)
+            with adb_budget(self.adb, deadline):
+                xml = self.screen.dump_xml()
+            if xml:
+                if time.monotonic() > deadline:
+                    self._check_wait(deadline)
+                self._last_observed_xml = xml
+                return xml
+            if attempt < 2:
+                self.retry_count += 1
+                self._poll(min(POLL_INTERVAL, max(0.0, deadline - time.monotonic())))
+        raise self._stop("Không đọc được màn hình máy ảo qua ADB sau 3 lần đọc.")
 
     def _stop(self, message: str) -> "PickStopped":
         return PickStopped(message, self._screenshot())
@@ -240,7 +341,9 @@ class PickRunner:
     def _screenshot(self) -> str | None:
         if not self.config.capture_screenshot:
             return None
-        data = self.screen.screenshot_png()
+        # Diagnostic capture has its own short allowance after the step expired.
+        with adb_budget(self.adb, time.monotonic() + 1.5):
+            data = self.screen.screenshot_png()
         if not data:
             return None
         try:
@@ -258,6 +361,7 @@ class PickRunner:
     def _wait_for_id(self, resource_id: str, timeout: float | None = None) -> str:
         return self._wait_for_any_id((resource_id,), timeout)
 
+    @bounded_step
     def _wait_for_any_id(self, resource_ids, timeout: float | None = None) -> str:
         """
         Chờ tới khi màn hình có một trong các phần tử này, trả về bản dump lúc
@@ -275,7 +379,7 @@ class PickRunner:
         while True:
             if self._should_stop():
                 raise PickStopped("Người dùng bấm Dừng.")
-            xml = self.screen.dump_xml()
+            xml = self._dump(deadline)
             if xml:
                 last = xml
                 if any(first_with_id(xml, rid) for rid in resource_ids):
@@ -299,24 +403,44 @@ class PickRunner:
                     f"không xuất hiện {' hoặc '.join(repr(r) for r in resource_ids)}."
                     f"{extra}"
                 )
-            time.sleep(POLL_INTERVAL)
+            self._poll()
 
     def _tap_id(self, xml: str, resource_id: str) -> None:
+        if self._should_stop():
+            raise PickStopped("Người dùng bấm Dừng.")
         node = first_with_id(xml, resource_id)
         if not node:
             raise self._stop(f"Không tìm thấy nút '{resource_id}' trên màn hình.")
-        if not self.screen.tap_node(node):
-            raise self._stop(f"Gửi lệnh chạm '{resource_id}' thất bại.")
+        operation = self._begin_operation("tap", payload={"resource_id": resource_id})
+        deadline = getattr(self, "_active_deadline", None) or time.monotonic() + self.config.step_timeout
+        self._check_wait(deadline)
+        with adb_budget(self.adb, deadline):
+            if not self.screen.tap_node(node):
+                raise self._stop(f"Gửi lệnh chạm '{resource_id}' thất bại.")
+        # Keep the intention pending until the whole bill is verified closed.
 
-    def _type(self, text: str) -> None:
+    def _type(self, text: str, xml: str = "", deadline=None) -> None:
         """
         Gõ vào ô đang focus rồi Enter - dùng chung cho cả bốn ô nhập.
 
-        Luôn xóa ô trước (mặc định của `type_and_submit`): ô "Tìm theo mã OR"
-        giữ nguyên mã của đơn trước sau khi đóng phiên, nối thêm vào là ra một
-        mã không có thật.
+        Chỉ bỏ xóa khi snapshot hiện tại xác nhận đúng ô nhập trống.
+        Ô tìm OR còn mã cũ vẫn phải xóa trước khi nhập mã mới.
         """
-        self.backend.type_and_submit(text, "enter")
+        if self._should_stop():
+            raise PickStopped("Người dùng bấm Dừng.")
+        field = first_with_id(xml, RID_INPUT) if xml else None
+        empty = bool(field and field.get("class") == "EditText" and not field.get("text", "").strip())
+        self._begin_operation("input", payload={"text": text})
+        deadline = deadline or time.monotonic() + self.config.step_timeout
+        if getattr(self, "_active_deadline", None) is not None:
+            deadline = min(deadline, self._active_deadline)
+        self._check_wait(deadline)
+        started = time.monotonic()
+        try:
+            with adb_budget(self.adb, deadline):
+                self.backend.type_and_submit(text, "enter", clear_first=not empty)
+        finally:
+            self.input_seconds += time.monotonic()-started
 
     def _type_and_wait(self, text: str, resource_ids: tuple) -> str:
         """
@@ -343,9 +467,13 @@ class PickRunner:
 
     # ------------------------------------------------------------ các bước
 
+    @measure("bill")
     def run_bill(self, bill: str, rows: list[dict], ref: str = "") -> BillOutcome:
         outcome = BillOutcome(bill=bill, ref=ref, expected=len(rows))
         self.last_partial = []
+        self._bill = bill
+        self._completion_seen = False
+        self._counter_total = None
         self._pending_finish_xml = ""
         # Không xóa `_at_search_xml` ở đây: nó chính là kết luận mã trước vừa để
         # lại. `_open_picking_list` tự tiêu thụ và xóa.
@@ -387,6 +515,7 @@ class PickRunner:
             bill, total, dumps, dump_time, share,
         )
 
+    @bounded_step
     def _open_picking_list(self) -> None:
         """
         Vào màn hình tìm mã OR.
@@ -402,14 +531,16 @@ class PickRunner:
         như thường.
         """
         if self._at_search_xml:
+            self._search_before_xml = self._at_search_xml
             self._at_search_xml = ""
             return
 
         deadline = time.monotonic() + self.config.step_timeout
         while True:
-            xml = self._dump()
+            xml = self._dump(deadline)
 
             if self._is_search_screen(xml):
+                self._search_before_xml = xml
                 return
 
             if first_with_id(xml, RID_PICK_MENU):
@@ -423,21 +554,24 @@ class PickRunner:
                     f"'{RID_PICK_MENU}' lẫn ô tìm kiếm).\n\n"
                     f"Màn hình đang hiện: {self._describe(xml)}"
                 )
-            time.sleep(POLL_INTERVAL)
+            self._poll()
 
+    @bounded_step
     def _wait_for_search_screen(self) -> str:
         deadline = time.monotonic() + self.config.step_timeout
         while True:
-            xml = self._dump()
+            xml = self._dump(deadline)
             if self._is_search_screen(xml):
+                self._search_before_xml = xml
                 return xml
             if time.monotonic() >= deadline:
                 raise self._stop(
                     f"Bấm Lấy hàng xong nhưng không thấy màn hình tìm mã OR.\n\n"
                     f"Màn hình đang hiện: {self._describe(xml)}"
                 )
-            time.sleep(POLL_INTERVAL)
+            self._poll()
 
+    @bounded_step
     def _search_and_open(self, bill: str, serial_count: int) -> str:
         """
         Gõ mã OR rồi chờ danh sách lọc còn đúng một thẻ.
@@ -465,36 +599,39 @@ class PickRunner:
         nên gõ lại vẫn không thể mở nhầm đơn.
         """
         self._log(f"[{bill}] tìm mã OR")
+        before = getattr(self, "_search_before_xml", "")
+        previous_code = self._search_field_text(before) if before else ""
+        previous_cards = tuple(n.get("text", "") for n in nodes_with_id(before, RID_SESSION_CODE))
         self._type(bill)
 
         # Danh sách lọc bất đồng bộ; chờ tới khi đúng một thẻ khớp mã vừa gõ.
         deadline = time.monotonic() + self.config.step_timeout
-        empty_since = None
         stale_since = None
         retried = False
+        candidate = None
         wanted = normalize_match_text(bill)
         while True:
-            xml = self._dump()
+            xml = self._dump(deadline)
             cards = nodes_with_id(xml, RID_PROCEED)
             typed = self._search_field_text(xml)
             notes = nodes_with_id(xml, RID_NOTE)
             matching = [n for n in notes if wanted in normalize_match_text(n.get("text", ""))]
 
-            if len(cards) == 1 and (not typed or typed == wanted) and len(matching) <= 1:
-                break
-
-            if not cards and typed == wanted:
-                now = time.monotonic()
-                if empty_since is None:
-                    empty_since = now
-                elif now - empty_since >= self.config.search_timeout:
-                    raise self._not_found(
-                        f"Không tìm thấy mã OR '{bill}' trong danh sách Lấy hàng "
-                        f"(ô tìm kiếm đã nhận đủ mã nhưng không lọc ra thẻ nào "
-                        f"sau {self.config.search_timeout:.0f}s)."
-                    )
+            loading = self._search_loading(xml)
+            identity = tuple(n.get("text", "") for n in nodes_with_id(xml, RID_SESSION_CODE))
+            unchanged_old = bool(previous_code and previous_code != wanted and identity == previous_cards)
+            if len(cards) == 1 and typed == wanted and len(matching) <= 1 and not loading and not unchanged_old:
+                # A changed card identity proves the old response was replaced.
+                # Otherwise require an additional stable observation.
+                if identity != previous_cards or candidate == identity:
+                    break
+                candidate = identity
             else:
-                empty_since = None
+                candidate = None
+
+            if not cards and typed == wanted and not loading and self._fresh_empty_result(xml):
+                # A stale empty list from the previous query proves nothing.
+                raise self._not_found(f"Không tìm thấy mã OR '{bill}' (app đã trả kết quả rỗng).")
 
             # Ô đang giữ một mã khác hẳn: chữ bot gửi không vào được ô. Đợi cho
             # chắc (app có thể đang vẽ dở) rồi chạm vào ô và gõ lại một lần.
@@ -507,12 +644,11 @@ class PickRunner:
                         f"[{bill}] ô tìm kiếm còn '{typed}' - chạm vào ô rồi gõ lại"
                     )
                     self._tap_id(xml, RID_INPUT)
-                    self._type(bill)
+                    self._type(bill, xml)
                     retried = True
                     stale_since = None
-                    empty_since = None
                     deadline = time.monotonic() + self.config.step_timeout
-                    time.sleep(POLL_INTERVAL)
+                    self._poll()
                     continue
             elif typed == wanted:
                 stale_since = None
@@ -525,10 +661,12 @@ class PickRunner:
                         f"ký tự (đã chạm vào ô và gõ lại một lần vẫn không được). "
                         f"Dừng, vì thẻ lọc ra là của mã khác."
                     )
-                if not cards:
+                if not cards and typed == wanted and self._fresh_empty_result(xml) and not loading:
                     raise self._not_found(
                         f"Không tìm thấy mã OR '{bill}' trong danh sách Lấy hàng."
                     )
+                if not cards:
+                    raise self._stop(f"Không tìm thấy mã OR '{bill}' nhưng chưa có bằng chứng truy vấn đã hoàn tất; dừng để kiểm tra.")
                 if len(cards) == 1:
                     raise self._stop(
                         f"Mã OR '{bill}' lọc ra đúng một thẻ nhưng có {len(matching)} "
@@ -539,7 +677,7 @@ class PickRunner:
                     f"Mã OR '{bill}' lọc ra {len(cards)} phiên khớp - không dám "
                     f"bấm vì có thể mở nhầm đơn."
                 )
-            time.sleep(POLL_INTERVAL)
+            self._poll()
 
         session_node = first_with_id(xml, RID_SESSION_CODE)
         session_code = (session_node or {}).get("text", "")
@@ -558,6 +696,21 @@ class PickRunner:
         return session_code
 
     @staticmethod
+    def _search_loading(xml):
+        text = normalize_match_text(" ".join(n.get("text", "") for n in list_nodes(xml)))
+        return any(token in text for token in ("vui long doi", "dang tai", "loading", "please wait")) or any(
+            n.get("class") == "ProgressBar" for n in list_nodes(xml, False))
+
+    @staticmethod
+    def _search_empty(xml):
+        text = normalize_match_text(" ".join(n.get("text", "") for n in list_nodes(xml)))
+        return any(token in text for token in ("khong tim thay", "khong co ket qua", "no results", "no matching", "no data"))
+
+    def _fresh_empty_result(self, xml):
+        before = getattr(self, "_search_before_xml", "")
+        return self._search_empty(xml) and not self._search_empty(before)
+
+    @staticmethod
     def _search_field_text(xml: str) -> str:
         node = first_with_id(xml, RID_INPUT)
         return normalize_match_text((node or {}).get("text", ""))
@@ -571,6 +724,7 @@ class PickRunner:
         except ValueError:
             return None
 
+    @bounded_step
     def _pass_assistant_dialog(self) -> str:
         """
         Ngay sau khi vào phiên, app hiện hộp 'Picking assistant' (chọn ngôn ngữ).
@@ -582,7 +736,7 @@ class PickRunner:
         """
         deadline = time.monotonic() + self.config.step_timeout
         while True:
-            xml = self._dump()
+            xml = self._dump(deadline)
 
             if first_with_id(xml, RID_TOTE_COUNT) or first_with_id(xml, RID_NEXT_BIN):
                 return xml                  # đã vào thẳng màn hình quét
@@ -590,9 +744,11 @@ class PickRunner:
             has_title = first_with_id(xml, RID_DIALOG_TITLE)
             negative = first_with_id(xml, RID_DIALOG_NEGATIVE)
             if has_title and negative:
+                if "picking assistant" not in normalize_match_text(has_title.get("text", "")):
+                    raise self._stop(f"Hộp thoại chưa biết: {dialog_message(xml)}")
                 message = dialog_message(xml)
                 self._log(f"đóng hộp thoại trợ lý: {message}")
-                self.screen.tap_node(negative)
+                self._tap_id(xml, RID_DIALOG_NEGATIVE)
                 return self._wait_for_any_id((RID_TOTE_COUNT, RID_NEXT_BIN))
 
             if find_dismiss_button(xml) is not None:
@@ -604,7 +760,7 @@ class PickRunner:
                     f"Vào phiên xong nhưng không thấy màn hình quét.\n\n"
                     f"Màn hình đang hiện: {self._describe(xml)}"
                 )
-            time.sleep(POLL_INTERVAL)
+            self._poll()
 
     def _scan_tote(self, xml: str = "") -> str:
         """
@@ -641,7 +797,8 @@ class PickRunner:
                 "Cấu hình đang để trống."
             )
         self._log(f"quét tote {tote}")
-        return self._type_and_wait(tote, (RID_NEXT_BIN,))
+        self._type(tote, xml)
+        return self._wait_for_any_id((RID_NEXT_BIN,))
 
     def _scan_bin(self, xml: str = "") -> str:
         """
@@ -673,108 +830,112 @@ class PickRunner:
             )
 
         self._log(f"quét vị trí lấy hàng {bin_code}")
-        return self._type_and_wait(bin_code, (RID_BIN,))
+        self._type(bin_code, xml)
+        return self._wait_for_any_id((RID_BIN,))
 
     def _scan_serials(self, bill: str, rows: list[dict], xml: str = "") -> list[SerialResult]:
         if not xml:
             xml = self._wait_for_id(RID_BIN)
         counter = parse_counter((first_with_id(xml, RID_COUNTER) or {}).get("text", ""))
-        picked = counter[0] if counter else 0
+        if not counter:
+            raise self._stop("Không đọc được bộ đếm trước khi quét serial.")
+        picked = counter[0]
+        self._counter_total = counter[1]
+        if picked:
+            raise self._stop("Phiên đã có serial; cần đối chiếu trước khi chạy lại.")
+        self._scan_xml = xml
 
         results = []
         for index, row in enumerate(rows, start=1):
             # Trước khi gõ serial kế tiếp: chưa bấm gì, chưa chờ gì, nên đứng
             # lại ở đây là an toàn. Phiên vẫn mở nhưng chỉ nằm im.
-            self._wait_if_paused()
+            if self._wait_if_paused():
+                self._scan_xml = self._dump()
             if self._should_stop():
                 raise PickStopped("Người dùng bấm Dừng.")
 
             serial = row["value"]
             self._log(f"[{bill}] {index}/{len(rows)} quét {serial}")
-            self._type(serial)
+            xml, self._scan_xml = self._scan_xml, ""
+            if first_with_id(xml, RID_NEXT_BIN):
+                xml = self._scan_bin(xml)
+            if not first_with_id(xml, RID_BIN):
+                raise self._stop(f"[{bill}] chưa ở màn hình quét serial.")
+            operation = self._begin_operation("scan", row["row"], {"serial": serial, "previous": picked})
+            self._scan_deadline = time.monotonic() + self.config.step_timeout
+            try:
+                self._type(serial, xml, self._scan_deadline)
+            except AdbUnavailableError:
+                # Read the counter/dialog to reconcile a possibly delivered scan.
+                self._log(f"[{bill}] ADB mất phản hồi; đối chiếu serial, không gửi lại")
             picked = self._wait_for_pick(bill, serial, picked, last=index == len(rows))
             result = SerialResult(row=row["row"], serial=serial, status="OK")
             results.append(result)
             self.last_partial.append(result)
+            self._record_scan(result, operation)
         return results
 
+    @bounded_step
     def _wait_for_pick(self, bill: str, serial: str, previous: int, last: bool) -> int:
-        """
-        Chờ số đếm tăng đúng một đơn vị.
-
-        Đây là bằng chứng app đã nhận serial, chắc chắn hơn hẳn kiểu 'gõ xong là
-        coi như xong'. Ở serial cuối cùng app đóng phiên và hiện hộp thoại, lúc
-        đó không còn số đếm để đọc nữa - nên coi hộp thoại cũng là dấu hiệu xong.
-
-        """
-        deadline = time.monotonic() + self.config.step_timeout
+        deadline = getattr(self, "_scan_deadline", None) or time.monotonic() + self.config.step_timeout
         while True:
-            xml = self._dump()
-
-            counter_node = first_with_id(xml, RID_COUNTER)
-            if counter_node:
-                counter = parse_counter(counter_node.get("text", ""))
-                if counter and counter[0] > previous:
-                    return counter[0]
-
+            self._check_wait(deadline)
+            xml = self._dump(deadline)
+            # Dialogs have priority over a counter behind an overlay.
             if find_dismiss_button(xml) is not None:
-                message = dialog_message(xml)
-                if last:
-                    # Hộp thoại kết thúc phiên. Giữ lại bản dump: `_finish_session`
-                    # chạy ngay sau đây và việc đầu tiên nó làm là đi tìm đúng hộp
-                    # thoại này - đọc lại màn hình lần nữa là thừa.
+                kind = classify_session_dialog(xml, self.session_mode)
+                if last and kind in ("complete", "placement"):
+                    if self._counter_total is not None and previous + 1 != self._counter_total:
+                        raise self._stop(f"[{bill}] kết thúc trước khi bộ đếm đủ tổng đã xác nhận.")
+                    if kind == "placement":
+                        self._tap_id(xml, find_dismiss_button(xml)["resource_id"])
+                        self._poll()
+                        continue
                     self._pending_finish_xml = xml
+                    self._completion_seen = kind == "complete"
+                    self._scan_xml = ""
                     return previous + 1
-                raise self._stop(
-                    f"[{bill}] serial '{serial}': app báo lỗi - {message}"
-                )
-
+                raise self._stop(f"[{bill}] serial '{serial}': hộp thoại {kind} - {dialog_message(xml)}")
+            counter = parse_counter((first_with_id(xml, RID_COUNTER) or {}).get("text", ""))
+            if counter:
+                current, total = counter
+                if self._counter_total is not None and total != self._counter_total:
+                    raise self._stop(f"[{bill}] tổng bộ đếm thay đổi: {self._counter_total} -> {total}.")
+                if current > total or current < previous or current > previous + 1:
+                    raise self._stop(f"[{bill}] bộ đếm tăng sai: {previous} -> {current}/{total}.")
+                if current == previous + 1:
+                    self._scan_xml = xml
+                    return current
             if time.monotonic() >= deadline:
-                raise self._stop(
-                    f"[{bill}] serial '{serial}': quét xong mà số đếm không tăng "
-                    f"sau {self.config.step_timeout:.0f}s."
-                )
-            time.sleep(POLL_INTERVAL)
+                raise self._stop(f"[{bill}] serial '{serial}': số đếm không tăng sau {self.config.step_timeout:.0f}s.")
+            self._poll()
 
+    @bounded_step
     def _finish_session(self, bill: str) -> None:
-        """
-        Bấm OK trên hộp "Công việc lấy hàng đã kết thúc" rồi chờ về chỗ chạy
-        được đơn sau.
-
-        Nhận cả màn hình tìm mã OR (app trả về đây) lẫn menu chính (gặp khi
-        người dùng tự bấm Back). Có thể phải bấm hơn một lần: sau serial cuối app
-        còn chèn hộp "Vị trí cần đặt sản phẩm vừa lấy" trước hộp kết thúc.
-        """
         deadline = time.monotonic() + self.config.step_timeout
-        # Bản dump `_wait_for_pick` vừa đọc (đã thấy hộp thoại kết thúc) dùng
-        # được cho vòng đầu; từ vòng hai trở đi phải đọc lại vì mình vừa bấm.
         xml = self._pending_finish_xml
         self._pending_finish_xml = ""
         while True:
+            self._check_wait(deadline)
             if not xml:
-                xml = self._dump()
-
+                xml = self._dump(deadline)
             if first_with_id(xml, RID_PICK_MENU) or self._is_search_screen(xml):
-                # Chuyền kết luận này sang mã kế tiếp để nó khỏi đọc lại.
+                if not self._completion_seen:
+                    raise self._stop(f"[{bill}] đã về danh sách nhưng chưa xác nhận hoàn tất phiên.")
                 self._at_search_xml = xml if self._is_search_screen(xml) else ""
                 return
-
             button = find_dismiss_button(xml)
             if button:
+                kind = classify_session_dialog(xml, self.session_mode)
+                if kind not in ("complete", "placement"):
+                    raise self._stop(f"[{bill}] hộp thoại {kind} khi đóng phiên: {dialog_message(xml)}")
+                self._completion_seen |= kind == "complete"
                 self._log(f"[{bill}] kết thúc phiên: {dialog_message(xml)}")
-                self.screen.tap_node(button)
-                # Vừa bấm thì bản dump đang cầm hết giá trị - phải đọc lại.
-                xml = ""
-                time.sleep(POLL_INTERVAL)
-                continue
-
+                self._tap_id(xml, button["resource_id"])
             if time.monotonic() >= deadline:
-                raise self._stop(
-                    f"[{bill}] quét đủ serial nhưng không về được màn hình tìm "
-                    f"mã OR.\n\nMàn hình đang hiện: {self._describe(xml)}"
-                )
+                raise self._stop(f"[{bill}] quét đủ serial nhưng không về được màn hình tìm mã OR.")
             xml = ""
-            time.sleep(POLL_INTERVAL)
+            self._poll()
 
     @staticmethod
     def _describe(xml: str, limit: int = 12) -> str:

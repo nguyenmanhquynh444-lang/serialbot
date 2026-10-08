@@ -82,6 +82,7 @@ class FakePickDevice:
 
         self.state = "menu"
         self.filter_text = ""
+        self.instance_name = "Fake LDPlayer"
         self.active: Session | None = None
         self.picked = 0
         self.bin_index = 0
@@ -115,6 +116,9 @@ class FakePickDevice:
                     _node("btnProceed", "Lấy hàng", (20, top + 100, 700, top + 150), True,
                           "android.widget.Button"),
                 ]
+            if self.filter_text and not any(not s.done and self.filter_text.lower() in s.or_code.lower()
+                                            for s in self.sessions):
+                nodes.append(_node("emptyResult", "Không tìm thấy kết quả"))
             return _screen(nodes)
 
         if self.state == "assistant":
@@ -190,7 +194,7 @@ class FakePickDevice:
         self.commands.append(command)
 
         output = ""
-        for part in command.split(";"):
+        for part in re.split(r";| && ", command):
             part = part.strip()
             if not part:
                 continue

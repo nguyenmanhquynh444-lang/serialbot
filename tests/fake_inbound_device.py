@@ -62,6 +62,7 @@ class FakeInboundDevice:
 
         self.state = "menu"
         self.filter_text = ""
+        self.instance_name = "Fake LDPlayer"
         self.active: Checkin | None = None
         self.scanned = 0
         self.error = ""

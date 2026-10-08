@@ -68,6 +68,8 @@ class PickWorker(QThread):
         screenshot_dir: str = "screenshots",
         parent=None,
         runner_cls=PickRunner,
+        journal=None,
+        run_id=None,
     ):
         super().__init__(parent)
         self.groups = groups
@@ -83,6 +85,7 @@ class PickWorker(QThread):
         self.runner: PickRunner | None = None
 
         self._stop_flag = threading.Event()
+        self.adb_client.should_stop = self._stop_flag.is_set
         # set = đang chạy, clear = đang tạm dừng (giống BotWorker).
         self._pause_event = threading.Event()
         self._pause_event.set()
@@ -92,6 +95,10 @@ class PickWorker(QThread):
         self._done = 0
         self._success = 0
         self._error = 0
+        self.journal = journal
+        self.run_id = run_id
+        self.completion_state = "failed"
+        self.pause_seconds = 0.0
 
     def stop(self):
         self._stop_flag.set()
@@ -118,18 +125,29 @@ class PickWorker(QThread):
         """
         if self._pause_event.is_set():
             return
+        pause_started = time.monotonic()
         self.step_info.emit("Đã tạm dừng - bấm Resume để chạy tiếp.")
         while not self._pause_event.is_set():
             if self._stop_flag.is_set():
                 return
             self._pause_event.wait(0.2)
         self.step_info.emit("Chạy tiếp.")
+        self.pause_seconds += time.monotonic() - pause_started
+        if getattr(self, "runner", None):
+            self.runner.pause_seconds = self.pause_seconds
+        return True
 
     # ------------------------------------------------------------------ chạy
 
     def run(self):
+        try:
+            self._run()
+        except Exception as exc:
+            logger.exception("Pick worker failed run_id=%s", self.run_id)
+            self._emit_stopped(f"Không hoàn tất phiên: {exc}", "")
+
+    def _run(self):
         if not self._connect():
-            self.finished_all.emit()
             return
 
         self.runner = self.runner_cls(
@@ -140,6 +158,8 @@ class PickWorker(QThread):
             on_log=self.step_info.emit,
             should_stop=self._stop_flag.is_set,
             wait_if_paused=self._wait_if_paused,
+            journal=self.journal,
+            run_id=self.run_id,
         )
 
         total = len(self.groups)
@@ -151,7 +171,8 @@ class PickWorker(QThread):
 
         for index, group in enumerate(self.groups):
             # Giữa hai mã OR là điểm dừng sạch nhất: không có phiên nào đang mở.
-            self._wait_if_paused()
+            if self._wait_if_paused():
+                self.runner._at_search_xml = ""
             if self._stop_flag.is_set():
                 self._emit_stopped("Người dùng bấm Dừng.", "")
                 return
@@ -160,6 +181,8 @@ class PickWorker(QThread):
             rows = group["rows"]
             ref = group.get("ref", "")
             self.bill_started.emit(bill, len(rows))
+            if self.journal and self.run_id:
+                self.journal.begin(self.run_id, "bill", bill=bill, payload={"ref": ref, "rows": rows})
 
             try:
                 outcome = self.runner.run_bill(bill, rows, ref)
@@ -188,7 +211,7 @@ class PickWorker(QThread):
                 self.log_entry.emit(serial.row, serial.serial, serial.status, serial.message or "Đã xuất")
 
             self.done_bills.append(bill)
-            self.bill_done.emit({
+            bill_result = {
                 "bill": bill,
                 "ref": outcome.ref or ref,
                 "session_code": outcome.session_code,
@@ -196,9 +219,13 @@ class PickWorker(QThread):
                 "picked": outcome.picked,
                 "status": outcome.status,
                 "message": outcome.message,
-            })
+            }
+            if self.journal and self.run_id:
+                self.journal.complete_bill(self.run_id, bill_result)
+            self.bill_done.emit(bill_result)
             self.progress.emit(index + 1, total)
 
+        self.completion_state = "complete"
         logger.info(
             "Pick run finished: %d/%d phiên trong %.0fs",
             len(self.done_bills), total, time.monotonic() - started_at,
@@ -248,18 +275,22 @@ class PickWorker(QThread):
         trọn dòng đó - phiên chạy trông vẫn xanh nhưng file Excel không có gì.
         Gom về một hàm để ba chỗ phát tín hiệu không thể lệch nhau nữa.
         """
-        self.result_ready.emit({
+        record = {
             "row": row,
             "serial": serial,
             "bill": bill,
             "ref": ref,
             "status": status,
+            "verification": "confirmed",
             "message": message,
             "response_text": message,
             "screenshot_path": screenshot,
             "reason": reason,
             "time": datetime.now().strftime("%H:%M:%S"),
-        })
+        }
+        if self.journal and self.run_id:
+            self.journal.record_result(self.run_id, record)
+        self.result_ready.emit(record)
 
         self._done += 1
         if status == "OK":
@@ -295,7 +326,7 @@ class PickWorker(QThread):
             )
             self.log_entry.emit(row["row"], row["value"], "ERROR", message)
 
-        self.bill_done.emit({
+        bill_result = {
             "bill": bill,
             "ref": ref,
             "session_code": "",
@@ -303,9 +334,13 @@ class PickWorker(QThread):
             "picked": 0,
             "status": "ERROR",
             "message": message,
-        })
+        }
+        if self.journal and self.run_id:
+            self.journal.complete_bill(self.run_id, bill_result)
+        self.bill_done.emit(bill_result)
 
     def _emit_stopped(self, message: str, screenshot_path: str):
+        self.completion_state = "stopped"
         logger.error("Pick run stopped: %s", message)
         self.stopped.emit(message, screenshot_path)
         self.finished_all.emit()

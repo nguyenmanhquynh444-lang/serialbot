@@ -55,6 +55,7 @@ class RowResult:
     adb_failed: bool = False
     dismiss_failed: bool = False
     focus_failed: bool = False
+    verification: str = "inferred"
 
 
 def resolve_text(template: str, ctx: RowContext) -> str:
@@ -102,6 +103,7 @@ class ActionRunner:
         screenshot_dir: str = "screenshots",
         capture_screenshot_on_error: bool = False,
         screen=None,
+        should_stop=None,
     ):
         self.steps = steps
         self.backend = backend
@@ -109,6 +111,8 @@ class ActionRunner:
         self.screen = screen or getattr(backend, "screen", None) or ScreenReader(adb_client)
         self.screenshot_dir = screenshot_dir
         self.capture_screenshot_on_error = capture_screenshot_on_error
+        self.should_stop = should_stop or (lambda: False)
+        self.screen.should_stop = self.should_stop
         # Bước ngay trước có phải "xóa ô" chạy trót lọt không - xem _step_type.
         self._field_is_empty = False
 
@@ -117,6 +121,8 @@ class ActionRunner:
         previous_type = ""
 
         for index, step in enumerate(self.steps, start=1):
+            if self.should_stop():
+                raise StopRun("Người dùng bấm Dừng.")
             if not step.enabled:
                 continue
             # Chỉ tin "ô đang trống" khi bước xóa ô nằm NGAY TRƯỚC và đã chạy
@@ -281,7 +287,11 @@ class ActionRunner:
         return True, ""
 
     def _step_wait(self, step, ctx, result):
-        time.sleep(max(0.0, float(step.param("seconds"))))
+        deadline = time.monotonic() + max(0.0, float(step.param("seconds")))
+        while time.monotonic() < deadline:
+            if self.should_stop():
+                raise StopRun("Người dùng bấm Dừng.")
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         return True, ""
 
     def _step_wait_for(self, step, ctx, result):
@@ -338,6 +348,7 @@ class ActionRunner:
             for kw in success_kws:
                 if kw in content:
                     result.status = "OK"
+                    result.verification = "confirmed"
                     result.response_text = kw
                     result.message = f"Khớp từ khóa thành công: '{kw}'"
                     return True, ""
@@ -456,6 +467,7 @@ class ActionRunner:
     # ---------------------------------------------------------------- helpers
 
     def _record_error(self, result: RowResult, xml: str, reason: str, keyword: str, dismiss: bool):
+        result.verification = "confirmed"
         """
         Ghi lỗi kèm đúng câu app báo, rồi đóng hộp thoại.
 

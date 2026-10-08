@@ -288,7 +288,8 @@ def test_a_bill_does_not_read_the_screen_more_than_it_needs_to():
     device = FakePickDevice([Session("VD1", "PL_001", 1)])
     make_runner(device).run_bill("VD1", rows("S1"))
 
-    assert len(dumps_of(device)) <= 9
+    # A lone unchanged card needs one extra observation to reject stale results.
+    assert len(dumps_of(device)) <= 10
 
 
 # --- mã không có thật: kết luận nhanh, nhưng không được kết luận ẩu -----------

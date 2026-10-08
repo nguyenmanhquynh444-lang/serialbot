@@ -2,6 +2,8 @@
 
 Ứng dụng desktop (PyQt6) tự động đọc serial từ file Excel và nhập lần lượt vào app trên LDPlayer qua ADB, xác nhận kết quả thật, ghi lại kết quả và báo cáo.
 
+Đợt cập nhật tính đúng, phục hồi SQLite và tối ưu LDPlayer: xem [hướng dẫn triển khai và đo trước–sau](OPTIMIZATION_NOTES.md). Đường nhanh phân biệt kết quả đã xác nhận với kết quả chưa phát hiện lỗi.
+
 Có **ba kiểu chạy**, chọn ở ô "Kiểu chạy" đầu trang Cấu hình:
 
 | Kiểu chạy | Đơn vị công việc | Dùng khi |
@@ -50,7 +52,7 @@ python main.py
 ## Tính năng chính
 
 - **Chạy trên trình duyệt** — gắn vào Chrome đang mở và bấm bằng chính DOM: tự cuộn tới nút, tự chờ nút hết bị che và hết `disabled` rồi mới bấm, nên hết cảnh bấm trượt như bấm theo tọa độ; xem mục [Chạy trên trình duyệt](#chạy-trên-trình-duyệt-chrome).
-- **Nhập liệu qua ADB** (khuyến nghị) — gõ thẳng vào app, không cần focus cửa sổ LDPlayer, tự fallback sang gõ bàn phím nếu ADB lỗi.
+- **Nhập liệu qua ADB** (khuyến nghị) — gõ thẳng vào app, không cần focus cửa sổ LDPlayer. Có thể chọn bàn phím khi ADB không sẵn sàng trước lượt chạy; không tự gửi lại thao tác đã mất phản hồi.
 - **Background mode** — bật khi bạn muốn **vừa chạy bot vừa dùng máy làm việc khác**. Ở chế độ này bot chỉ dùng ADB và **không bao giờ** chuyển sang gõ bàn phím, nên không có nguy cơ gõ nhầm serial vào cửa sổ bạn đang làm. Nếu ADB lỗi, bot dừng và báo lỗi. LDPlayer có thể minimize hoặc nằm sau cửa sổ khác.
 - **Xác nhận kết quả thật** qua `uiautomator` — phân loại từng serial là `OK` / `ERROR` / `UNKNOWN` dựa trên từ khóa lỗi/thành công cấu hình được, thay vì mặc định "gõ xong là thành công".
 - **Gặp hộp thoại lỗi thì tự bấm OK và chạy tiếp** — đọc nội dung hộp thoại trước, ghi lại, rồi mới bấm; xem mục [Khi app báo lỗi](#khi-app-báo-lỗi).
@@ -60,7 +62,7 @@ python main.py
 - **Export Report** — file Excel riêng gồm 4 sheet: Summary (tổng/thành công/lỗi/không tìm thấy/tỉ lệ/tốc độ), Chi tiết, Lỗi, Không tìm thấy.
 - **Preview & validate** trước khi chạy — xem trước danh sách, cảnh báo serial trùng lặp, bỏ chọn từng dòng.
 - **Dry-run** — chỉ chạy thử N serial đầu để kiểm tra cấu hình.
-- **Checkpoint/Resume** — nếu app đóng hoặc crash giữa chừng, lần mở lại sẽ hỏi tiếp tục từ chỗ dừng (bỏ qua các dòng đã xử lý).
+- **Nhật ký SQLite/Resume** — khớp đúng dữ liệu, sheet, mode và cấu hình; giữ kết quả dù Excel chưa lưu. Thao tác chưa rõ kết quả phải đối chiếu trên app trước khi tiếp tục.
 - **Retry Errors** — chạy lại riêng các dòng lỗi mà không cần đọc lại Excel.
 - **Chạy song song nhiều instance LDPlayer** — tick nhiều instance trong danh sách, serial được chia đều, mỗi instance có thanh tiến độ riêng.
 - **Xuất kho theo mã OR** — gộp serial theo mã OR rồi chạy trọn một phiên lấy hàng cho từng mã (tìm phiên → tote → vị trí lấy hàng → quét serial → đóng phiên); xem mục [Chế độ xuất kho theo mã OR](#chế-độ-xuất-kho-theo-mã-or).
@@ -166,7 +168,7 @@ Dừng nghĩa là **trên LDPlayer còn một phiên lấy hàng đang dở** �
 - **Những serial đã kịp vào phiên**, ghi với lý do `Đã xuất trước khi dừng` — để biết phiên dở tới đâu mà dọn.
 - **Checkpoint** các mã OR đã xong trọn vẹn. Lần chạy sau bot hỏi *"Lần trước đã xong N mã OR — bỏ qua và chạy tiếp phần còn lại?"*; chọn No là chạy lại từ đầu.
 
-Nút **Tạm dừng** bị khóa ở chế độ này: dừng giữa một phiên lấy hàng không có trạng thái nào an toàn để treo lại.
+**Tạm dừng** ở chế độ này chỉ có hiệu lực ở điểm an toàn kế tiếp (hết mã OR đang chạy, hoặc hết serial đang quét), không cắt ngang giữa một bước: dừng giữa một phiên lấy hàng không có trạng thái nào an toàn để treo lại.
 
 Luồng này **chỉ chạy qua ADB**, không có đường lui gõ bàn phím như chế độ thường — gõ nhầm vào cửa sổ Windows giữa một phiên là hỏng đơn thật, nên thà không chạy. ADB không phản hồi thì bot báo lỗi ngay từ đầu.
 
@@ -574,7 +576,7 @@ Nếu app đang chạy lúc cài/gỡ, bộ cài phát hiện qua mutex và nh�
 
 ### Đẩy bản mới xuống máy client
 
-Máy client mới tinh thì đưa [`deploy/HUONG-DAN-CAI-DAT.md`](deploy/HUONG-DAN-CAI-DAT.md) — hướng dẫn đầy đủ từ khâu chuẩn bị LDPlayer tới chạy thử mã đầu tiên. Máy đã có bot thì chỉ cần bản cập nhật.
+Máy client mới tinh thì đưa [`deploy/HUONG-DAN-CAI-DAT.md`](deploy/HUONG-DAN-CAI-DAT.md) — hướng dẫn đầy đủ từ khâu chuẩn bị LDPlayer tới chạy thử mã đầu tiên. Người vận hành kho thì đưa thêm [`deploy/HUONG-DAN-NHAP-XUAT-SERIAL.md`](deploy/HUONG-DAN-NHAP-XUAT-SERIAL.md) — cài đặt rút gọn và cách chạy nhập hàng (check-in), xuất kho (OR), đọc kết quả, xử lý khi dừng giữa chừng. Máy đã có bot thì chỉ cần bản cập nhật.
 
 Client giữ sẵn [`deploy/Cap-nhat.bat`](deploy/Cap-nhat.bat) trên Desktop. Ra bản mới thì họ bấm lại đúng file đó: script tải bộ cài mới nhất từ GitHub Releases, tự đóng app nếu đang mở, cài đè im lặng rồi mở lại app. Không cần Python, không cần quyền admin, không hiện UAC. Dữ liệu trong `%LOCALAPPDATA%\SerialBot` nằm ngoài thư mục cài nên không bị đụng tới.
 
@@ -596,7 +598,8 @@ Bản **đã cài** không ghi gì vào thư mục cài (Program Files là chỉ
 ├── screenshots/    # ảnh chụp bằng chứng khi lỗi/unknown
 ├── recipes/        # kịch bản (kịch bản mặc định được chép sang lần chạy đầu)
 ├── device_profile.json  # những gì đã dò được về máy ảo + app, để phiên sau chạy nhanh ngay
-└── session.json    # checkpoint để resume
+├── run_journal.sqlite3  # ý định, kết quả và trạng thái phục hồi bền vững
+└── session.json    # checkpoint cũ, chỉ dùng tham khảo
 ```
 
 Chạy từ mã nguồn (`python main.py`) thì vẫn ghi cạnh dự án như trước — xem `paths.py`.

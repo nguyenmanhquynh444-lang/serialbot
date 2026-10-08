@@ -114,7 +114,7 @@ def test_clearing_the_field_uses_a_single_input_invocation():
     adb = RecordingAdb()
     AdbBackend(adb).type_serial("X")
 
-    clear_part = adb.commands[0].split("; input text")[0]
+    clear_part = adb.commands[0].split(" && input text")[0]
     assert clear_part.count("input keyevent") == 1
     assert clear_part.split().count("67") == CLEAR_DEL_COUNT
 
@@ -131,7 +131,7 @@ def test_no_enter_sends_nothing():
     assert adb.commands == []
 
 
-def test_old_devices_fall_back_to_one_keycode_per_command():
+def test_old_devices_are_probed_before_business_input():
     """
     Bản `input` quá cũ không hiểu nhiều keycode một lượt. Không được để nó bị
     hiểu nhầm thành máy ảo chết - đó là lỗi sẽ dừng cả phiên chạy.
@@ -139,17 +139,19 @@ def test_old_devices_fall_back_to_one_keycode_per_command():
     class PickyAdb(RecordingAdb):
         def run_shell(self, command, timeout=None):
             self.commands.append(command)
-            first = command.split(";")[0].split()
+            first = command.split(" && ")[0].split(";")[0].split()
             if first[:2] == ["input", "keyevent"] and len(first) > 3:
                 return None            # `input` báo sai cú pháp
             return ""
 
     adb = PickyAdb()
     backend = AdbBackend(adb)
+    backend.probe_keys()
+    adb.commands.clear()
     backend.type_and_submit("ABC123", "enter")
 
-    assert len(adb.commands) == 2                    # thử gộp, hụt, gửi lại kiểu cũ
-    assert "input keyevent 123; input keyevent 28" in adb.commands[1]
+    assert len(adb.commands) == 1                    # chosen before any serial is sent
+    assert "input keyevent 123 && input keyevent 28" in adb.commands[0]
 
     adb.commands.clear()
     backend.type_and_submit("DEF456", "enter")

@@ -9,6 +9,18 @@ import re
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
+from functools import lru_cache
+from contextlib import contextmanager
+
+
+@contextmanager
+def adb_budget(client, deadline):
+    previous = getattr(client, "deadline", None)
+    client.deadline = min(previous, deadline) if previous is not None else deadline
+    try:
+        yield
+    finally:
+        client.deadline = previous
 
 ERROR_DIALOG_TOKENS = ("dialog", "alert", "popup")
 _NODE_RE = re.compile(r"<node\b[^>]*>")
@@ -217,6 +229,7 @@ def dialog_marker(screen_xml: str) -> str:
     return ""
 
 
+@lru_cache(maxsize=32)
 def _parse_tree(screen_xml: str):
     if not screen_xml.strip():
         return None
@@ -311,7 +324,8 @@ def find_dismiss_button(screen_xml: str, labels: tuple = DISMISS_LABELS) -> dict
     return best
 
 
-def list_nodes(screen_xml: str, only_interesting: bool = True) -> list[dict]:
+@lru_cache(maxsize=32)
+def _parsed_nodes(screen_xml: str) -> tuple:
     """Flatten a dump into rows for the UI inspector."""
     rows = []
     for node in iter_nodes(screen_xml):
@@ -323,12 +337,30 @@ def list_nodes(screen_xml: str, only_interesting: bool = True) -> list[dict]:
             "clickable": xml_attr(node, "clickable") == "true",
             "class": xml_attr(node, "class").rsplit(".", 1)[-1],
         }
-        if only_interesting and not (
-            entry["text"] or entry["content_desc"] or entry["resource_id"]
-        ):
-            continue
         rows.append(entry)
-    return rows
+    return tuple(rows)
+
+
+def list_nodes(screen_xml: str, only_interesting: bool = True) -> list[dict]:
+    return [dict(node) for node in _parsed_nodes(screen_xml) if not only_interesting
+            or node["text"] or node["content_desc"] or node["resource_id"]]
+
+
+@lru_cache(maxsize=32)
+def _node_id_index(screen_xml: str):
+    index = {}
+    for node in _parsed_nodes(screen_xml):
+        parts = node["resource_id"].split("/")
+        for offset in range(len(parts)):
+            key = "/".join(parts[offset:])
+            if key:
+                index.setdefault(key, []).append(node)
+    return index
+
+
+def nodes_by_id(screen_xml: str, resource_id: str) -> list[dict]:
+    """Look up a snapshot by full resource id or suffix, returning safe copies."""
+    return [dict(node) for node in _node_id_index(screen_xml).get(resource_id.strip(), ())]
 
 
 class ScreenReader:
@@ -361,6 +393,9 @@ class ScreenReader:
         # nhìn log là biết thời gian đi đâu, khỏi phải đoán.
         self.dump_count = 0
         self.dump_seconds = 0.0
+        self.should_stop = lambda: False
+        self.focus_seconds = 0.0
+        self.screenshot_seconds = 0.0
 
     def disable_compressed(self) -> bool:
         """
@@ -417,7 +452,11 @@ class ScreenReader:
 
     def focused_window(self) -> str | None:
         """None means adb could not be reached, '' means nothing was focused."""
-        output = self.adb.run_shell("dumpsys window windows")
+        started = time.monotonic()
+        try:
+            output = self.adb.run_shell("dumpsys window windows")
+        finally:
+            self.focus_seconds += time.monotonic() - started
         if output is None:
             return None
         return current_focus_window(output)
@@ -439,7 +478,12 @@ class ScreenReader:
         """Poll until a matching node appears. Returns the node, or None on timeout."""
         deadline = time.monotonic() + timeout
         while True:
-            xml = self.dump_xml()
+            if self.should_stop() or time.monotonic() >= deadline:
+                return None
+            with adb_budget(self.adb, deadline):
+                xml = self.dump_xml()
+            if self.should_stop() or time.monotonic() >= deadline:
+                return None
             if xml:
                 found = find_node(xml, text, resource_id, content_desc)
                 if found:
@@ -461,4 +505,8 @@ class ScreenReader:
         return self.adb.run_shell(f"input swipe {x1} {y1} {x2} {y2} {duration_ms}") is not None
 
     def screenshot_png(self) -> bytes | None:
-        return self.adb.run_exec_out_binary("screencap -p")
+        started = time.monotonic()
+        try:
+            return self.adb.run_exec_out_binary("screencap -p")
+        finally:
+            self.screenshot_seconds += time.monotonic() - started

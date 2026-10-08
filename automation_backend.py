@@ -9,6 +9,7 @@ without a working adb/ldconsole install.
 """
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -189,7 +190,7 @@ def _keyevents(keycodes: list[str], batched: bool = True) -> str:
     """
     if batched:
         return "input keyevent " + " ".join(keycodes)
-    return "; ".join(f"input keyevent {code}" for code in keycodes)
+    return " && ".join(f"input keyevent {code}" for code in keycodes)
 
 
 def shell_quote(value: str) -> str:
@@ -279,7 +280,7 @@ def parse_guarded(output: str) -> GuardedInput | None:
     return GuardedInput(focus_line=focus, typed=typed, failed=failed, stages=tuple(stages))
 
 
-def list_ldplayer_instances() -> list[dict]:
+def list_ldplayer_instances(timeout=5) -> list[dict]:
     """Return [{"index": str, "name": str, "running": bool}, ...] via `ldconsole list2`."""
     path = find_ldplayer_tool("ldconsole.exe")
     if not path:
@@ -290,7 +291,7 @@ def list_ldplayer_instances() -> list[dict]:
             [path, "list2"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=max(.001, timeout),
             creationflags=_CREATE_NO_WINDOW,
         )
     except (subprocess.TimeoutExpired, OSError):
@@ -312,9 +313,8 @@ class AdbClient:
     """
     Runs shell commands against one LDPlayer instance.
 
-    Prefers `ldconsole.exe adb --name <instance>` because it targets the
-    right instance even when several are running. Falls back to a plain
-    `adb` call when only one device is connected and ldconsole is missing.
+    Uses direct ADB only after mapping the selected instance to a device.
+    Otherwise selects ldconsole before sending. Failed sends are never replayed.
     """
 
     def __init__(self, instance_name: str, timeout: float = DEFAULT_TIMEOUT_SECONDS):
@@ -325,6 +325,18 @@ class AdbClient:
         self._adb_path: str | None = None
         self._direct_target: str | None = None
         self._direct_target_resolved = False
+        self.deadline: float | None = None
+        self.command_count = 0
+        self.command_seconds = 0.0
+        self.should_stop = lambda: False
+
+    def _remaining_timeout(self, timeout=None):
+        if self.should_stop():
+            return 0.0
+        seconds = self.timeout if timeout is None else timeout
+        if self.deadline is not None:
+            seconds = min(seconds, self.deadline - time.monotonic())
+        return max(0.0, seconds)
 
     def _find_ldconsole(self) -> str | None:
         if self._ldconsole_checked:
@@ -351,7 +363,7 @@ class AdbClient:
                 [adb, "devices"],
                 capture_output=True,
                 text=True,
-                timeout=self.timeout,
+                timeout=max(0.001, self._remaining_timeout()),
                 creationflags=_CREATE_NO_WINDOW,
             )
         except (subprocess.TimeoutExpired, OSError):
@@ -363,16 +375,13 @@ class AdbClient:
             if len(parts) >= 2 and parts[1] == "device":
                 devices.append(parts[0])
 
-        if len(devices) == 1:
-            self._direct_target = devices[0]
-            self._direct_target_resolved = True
-        elif devices:
+        if devices:
             # Nhiều máy ảo thì phải biết đúng cái nào mang tên instance này -
             # gửi nhầm máy là serial chạy sang phiên kiểm đếm khác.
             wanted = self._device_for_instance()
             if wanted in devices:
                 self._direct_target = wanted
-            self._direct_target_resolved = True
+            self._direct_target_resolved = bool(self._direct_target)
         # Chưa thấy máy nào thì đừng nhớ: nhiều khi bot mở trước lúc LDPlayer
         # boot xong, nhớ luôn kết quả rỗng là cả phiên phải đi đường chậm.
         return self._direct_target
@@ -388,7 +397,10 @@ class AdbClient:
         kể cả khi chạy nhiều máy ảo - vừa nhanh hơn ~430ms mỗi lệnh, vừa tránh
         được lỗi ldconsole làm hỏng tiếng Việt.
         """
-        for entry in list_ldplayer_instances():
+        timeout = self._remaining_timeout(5)
+        if timeout <= 0:
+            return ""
+        for entry in list_ldplayer_instances(timeout=timeout):
             if entry.get("name") == self.instance_name:
                 try:
                     return f"emulator-{5554 + 2 * int(entry['index'])}"
@@ -411,7 +423,7 @@ class AdbClient:
                 timeout=timeout,
                 creationflags=_CREATE_NO_WINDOW,
             )
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, OSError):
             return None
         if result.returncode != 0 or looks_like_adb_failure(result.stdout):
             return None
@@ -419,7 +431,9 @@ class AdbClient:
 
     def run_shell(self, shell_command: str, timeout: float | None = None) -> str | None:
         """Run a shell command on the device. Returns stdout, or None on failure/timeout."""
-        timeout = timeout or self.timeout
+        timeout = self._remaining_timeout(timeout)
+        if timeout <= 0:
+            return None
 
         # Chỉ có đúng một máy ảo đang chạy thì gọi thẳng adb. ldconsole cũng chỉ
         # đi gọi lại adb, nên đi vòng qua nó là thừa hẳn một lần dựng tiến trình
@@ -428,13 +442,22 @@ class AdbClient:
         # thì vẫn phải qua ldconsole vì chỉ nó biết tên nào ứng với máy nào.
         adb = self._find_adb()
         target = self._resolve_direct_target(adb) if adb else None
+        timeout = self._remaining_timeout(timeout)
+        if timeout <= 0:
+            return None
         if adb and target:
-            output = self._run_direct(adb, shell_command, timeout, target)
-            if output is not None:
-                return output
+            # A timeout may mean the command already reached Android. Never
+            # resend through another transport; callers may retry READS only.
+            started = time.monotonic()
+            try:
+                return self._run_direct(adb, shell_command, timeout, target)
+            finally:
+                self.command_count += 1
+                self.command_seconds += time.monotonic() - started
 
         ldconsole = self._find_ldconsole()
         if ldconsole:
+            started = time.monotonic()
             try:
                 result = subprocess.run(
                     [
@@ -454,25 +477,35 @@ class AdbClient:
                 )
                 if result.returncode == 0 and not looks_like_adb_failure(result.stdout):
                     return result.stdout
-            except subprocess.TimeoutExpired:
+            except (subprocess.TimeoutExpired, OSError):
                 return None
+            finally:
+                self.command_count += 1
+                self.command_seconds += time.monotonic() - started
 
         if not adb or target:
             # Đã thử đường thẳng ở trên rồi thì không thử lại.
             return None
-        return self._run_direct(adb, shell_command, timeout, None)
+        # An unnamed single device is not evidence of the selected instance.
+        return None
 
     def run_exec_out_binary(self, shell_command: str, timeout: float | None = None) -> bytes | None:
         """Run `adb exec-out <cmd>` and return raw bytes (for binary output like screencap)."""
-        timeout = timeout or self.timeout
+        timeout = self._remaining_timeout(timeout)
+        if timeout <= 0:
+            return None
         adb = self._find_adb()
         if not adb:
             return None
 
         cmd = [adb]
         target = self._resolve_direct_target(adb)
-        if target:
-            cmd.extend(["-s", target])
+        if not target:
+            return None
+        timeout = self._remaining_timeout(timeout)
+        if timeout <= 0:
+            return None
+        cmd.extend(["-s", target])
         cmd.extend(["exec-out", shell_command])
         try:
             result = subprocess.run(
@@ -481,7 +514,7 @@ class AdbClient:
                 timeout=timeout,
                 creationflags=_CREATE_NO_WINDOW,
             )
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, OSError):
             return None
         if result.returncode != 0 or not result.stdout:
             return None
@@ -570,7 +603,15 @@ class AdbBackend(AutomationBackend):
         self._guard_ok: bool | None = None
 
     def is_available(self) -> bool:
-        return adb_answers(self.adb)
+        available = adb_answers(self.adb)
+        if available:
+            self.probe_keys()
+        return available
+
+    def probe_keys(self) -> None:
+        """Read input's help before any business input; do not retry a scan."""
+        output = self.adb.run_shell("input")
+        self._batched_keys_ok = bool(output and re.search(r"keyevent[^\n]*(?:\.\.\.|<keycode> \[)", output))
 
     # ------------------------------------------------ gộp Enter vào input text
 
@@ -614,7 +655,7 @@ class AdbBackend(AutomationBackend):
 
     def type_serial(self, serial: str) -> None:
         self._send(lambda batched: (
-            f"{self._clear_command(batched)}; input text {shell_quote(serial)}"
+            f"{self._clear_command(batched)} && input text {shell_quote(serial)}"
         ))
 
     def send_enter(self, mode: str) -> None:
@@ -629,8 +670,8 @@ class AdbBackend(AutomationBackend):
         (`input keyevent 123; input keyevent 28; input keyevent 67 67 ...`) - mà
         mỗi lệnh `input` là một lần dựng tiến trình Java, khoản đắt nhất của mọi
         thao tác gõ (đo trên máy thật: ~300ms mỗi lần). Đúng dãy phím ấy gộp làm
-        một lệnh thì chỉ còn một lần dựng, và máy ảo nào không nhận cú pháp
-        nhiều keycode vẫn có đường lui sẵn trong `_send`.
+        một lệnh thì chỉ còn một lần dựng. Cú pháp nhiều keycode được dò trước
+        thao tác nghiệp vụ; lệnh nhập bị lỗi không được gửi lại.
         """
         self._send(self._clear_command)
 
@@ -644,7 +685,7 @@ class AdbBackend(AutomationBackend):
         điều đó trước (xem BotWorker._field_self_clears), vì đoán sai thì serial
         sau nối vào serial trước và gửi đi một mã không có thật.
         """
-        self._send(lambda batched: "; ".join(
+        self._send(lambda batched: " && ".join(
             command for _, command in self._input_parts(serial, mode, clear_first, batched)
         ))
 
@@ -660,39 +701,26 @@ class AdbBackend(AutomationBackend):
         Như `type_and_submit`, nhưng đọc cửa sổ đang focus trong cùng một lượt và
         bỏ qua việc gõ nếu màn hình đã đổi khác (xem `guarded_script`).
         """
-        while True:
-            parts = self._input_parts(serial, mode, clear_first, self._batched_keys_ok)
-            output = self._run_or_raise(
-                guarded_script([command for _, command in parts], expected_focus, profile)
-            )
-            parsed = parse_guarded(output)
-            if parsed is None:
-                # Không đọc nổi output thì không được đoán là đã gõ hay chưa.
-                raise AdbUnavailableError(
-                    f"Lệnh gõ trên instance '{self.adb.instance_name}' trả về "
-                    f"kết quả không đọc được"
-                )
-            if not parsed.failed:
-                parsed.labels = tuple(label for label, _ in parts)
-                return parsed
-
-            # Lệnh chạy nhưng báo lỗi. Thử bỏ dần các lối tắt chưa được xác nhận
-            # trước khi kết luận máy ảo hỏng.
-            if self._submit_with_text and not self._text_submit_confirmed:
-                self.disable_text_submit()
-                logger.info(
-                    "`input text` không nhận ký tự xuống dòng, quay về gửi Enter riêng"
-                )
-                continue
-            if self._batched_keys_ok:
-                self._batched_keys_ok = False
-                logger.info(
-                    "Máy ảo không nhận `input keyevent` nhiều phím, chuyển sang gửi từng phím"
-                )
-                continue
+        parts = self._input_parts(serial, mode, clear_first, self._batched_keys_ok)
+        output = self._run_or_raise(
+            guarded_script([command for _, command in parts], expected_focus, profile)
+        )
+        parsed = parse_guarded(output)
+        if parsed is None:
+            # Không đọc nổi output thì không được đoán là đã gõ hay chưa.
             raise AdbUnavailableError(
-                f"Lệnh gõ thất bại trên instance '{self.adb.instance_name}'"
+                f"Lệnh gõ trên instance '{self.adb.instance_name}' trả về "
+                f"kết quả không đọc được"
             )
+        if not parsed.failed:
+            parsed.labels = tuple(label for label, _ in parts)
+            return parsed
+
+        # Even a parsed failure may have occurred AFTER text/Enter.
+        # Leave reconciliation to the runner; never replay the script.
+        raise AdbUnavailableError(
+            f"Lệnh gõ thất bại trên instance '{self.adb.instance_name}'"
+        )
 
     def _input_parts(
         self, serial: str, mode: str, clear_first: bool, batched: bool
@@ -727,41 +755,20 @@ class AdbBackend(AutomationBackend):
         bước. Cho máy ảo tự ngủ một nhịp ngay trước khi dump thì lần đọc đầu
         tiên đã là màn hình mới.
 
-        Nối bằng `;` chứ không phải `&&`: máy nào không có `sleep` phân số thì
-        chặng đó hỏng nhưng lệnh dump vẫn chạy - bên gọi chỉ mất nhịp chờ rồi
-        quay về vòng poll như cũ, chứ không đổ cả lượt chạy.
+        Các chặng nối bằng `&&` để lỗi nhập không bị che bởi dump thành công.
+        Luồng OR mặc định không dùng cách ghép thêm sleep này.
         """
         def build(batched: bool) -> str:
             parts = [
                 command
                 for _, command in self._input_parts(serial, mode, clear_first, batched)
             ]
-            return "; ".join(parts + [f"sleep {settle_seconds:.2f}", dump_command])
+            return " && ".join(parts + [f"sleep {settle_seconds:.2f}", dump_command])
 
-        try:
-            return self._run_or_raise(build(self._batched_keys_ok))
-        except AdbUnavailableError:
-            if not self._batched_keys_ok:
-                raise
-
-        output = self._run_or_raise(build(False))
-        self._batched_keys_ok = False
-        logger.info("Máy ảo không nhận `input keyevent` nhiều phím, chuyển sang gửi từng phím")
-        return output
+        return self._run_or_raise(build(self._batched_keys_ok))
 
     def _send(self, build) -> None:
-        try:
-            self._run_or_raise(build(self._batched_keys_ok))
-            return
-        except AdbUnavailableError:
-            if not self._batched_keys_ok:
-                raise
-
-        # Thử lại kiểu tách rời trước khi kết luận máy ảo chết: có thể chỉ là
-        # bản `input` cũ không hiểu nhiều keycode trong một lệnh.
-        self._run_or_raise(build(False))
-        self._batched_keys_ok = False
-        logger.info("Máy ảo không nhận `input keyevent` nhiều phím, chuyển sang gửi từng phím")
+        self._run_or_raise(build(self._batched_keys_ok))
 
     @staticmethod
     def _clear_command(batched: bool = True) -> str:

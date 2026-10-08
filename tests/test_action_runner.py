@@ -80,6 +80,25 @@ def test_resolve_serial_and_row():
     assert resolve_text("SP-{serial}-{row}", ctx()) == "SP-ABC123-7"
 
 
+def test_stop_interrupts_recipe_wait_before_next_input():
+    import threading
+    import time
+    stop = threading.Event()
+    backend = FakeBackend()
+    runner = ActionRunner([Step("wait", {"seconds": 3}), Step("type", {"text": "S1"})],
+                          backend, FakeAdb(), should_stop=stop.is_set)
+    timer = threading.Timer(.05, stop.set)
+    started = time.monotonic()
+    timer.start()
+    try:
+        with pytest.raises(StopRun):
+            runner.run_row(ctx())
+    finally:
+        timer.cancel()
+    assert time.monotonic() - started < .5
+    assert backend.typed == []
+
+
 def test_resolve_cell_reference():
     assert resolve_text("{cell:B}", ctx()) == "Sản phẩm X"
 
