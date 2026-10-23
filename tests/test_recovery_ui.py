@@ -8,7 +8,7 @@ from openpyxl import Workbook
 
 import bot_gui
 import excel_writer
-from bot_gui import BotGUI, MODE_SERIAL
+from bot_gui import BotGUI, MODE_PICK, MODE_SERIAL
 from bot_worker import SerialItem
 
 
@@ -66,6 +66,57 @@ def test_ambiguous_intention_is_never_replayed_automatically(gui, monkeypatch):
     assert [item.row for item in remaining] == [3]
     assert gui.journal.pending(run) == []
     assert gui.journal.results(run)[0]["status"] == "UNKNOWN"
+
+
+def groups():
+    return [{"bill": f"OR{n}", "ref": f"R{n}", "rows": [{"row": 2 * n, "value": f"S{n}"},
+                                                       {"row": 2 * n + 1, "value": f"S{n}b"}]}
+            for n in (1, 2, 3)]
+
+
+def stop_bill_two(gui, *, opened):
+    """OR1 xong; OR2 dừng giữa chừng; OR3 chưa chạy - đúng cảnh 'ADB hụt lúc gõ mã OR'."""
+    run = gui.run_id
+    gui.journal.begin(run, "bill", bill="OR1")
+    gui.journal.complete_bill(run, {"bill": "OR1", "picked": 2, "status": "OK"})
+    gui.journal.begin(run, "bill", bill="OR2")
+    if opened:
+        gui.journal.begin(run, "tap", bill="OR2", payload={"resource_id": "btnProceed"})
+    gui.journal.begin(run, "input", bill="OR2", payload={"text": "OR2"})
+    gui.journal.set_state(run, "stopped")
+
+
+def test_pick_bill_stopped_before_opening_a_session_is_run_again(gui, monkeypatch):
+    gui._prepare_journal(groups(), MODE_PICK)
+    stop_bill_two(gui, opened=False)
+    asked = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: asked.append(args) or QMessageBox.StandardButton.Cancel)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    remaining = gui._prepare_journal(groups(), MODE_PICK)
+    assert asked == []                                  # không có gì để bắt người dùng đối chiếu
+    assert [g["bill"] for g in remaining] == ["OR2", "OR3"]
+    assert [b["bill"] for b in gui.journal.bills(gui.run_id)] == ["OR1"]
+    assert not any(r["status"] == "UNKNOWN" for r in gui.journal.results(gui.run_id))
+
+
+def test_pick_bill_that_opened_a_session_is_still_skipped_after_review(gui, monkeypatch):
+    gui._prepare_journal(groups(), MODE_PICK)
+    stop_bill_two(gui, opened=True)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: QMessageBox.StandardButton.Yes)
+    remaining = gui._prepare_journal(groups(), MODE_PICK)
+    assert [g["bill"] for g in remaining] == ["OR3"]
+    assert {r["row"]: r["status"] for r in gui.journal.results(gui.run_id)} == {4: "UNKNOWN", 5: "UNKNOWN"}
+
+
+def test_review_button_does_not_ask_about_untouched_bills(gui, monkeypatch):
+    gui._prepare_journal(groups(), MODE_PICK)
+    stop_bill_two(gui, opened=False)
+    shown = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: shown.append(args[2]))
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: pytest.fail("không được hỏi đối chiếu"))
+    gui._review_unresolved_progress()
+    assert "1 mã dừng trước khi mở phiên" in shown[0]
+    assert gui.journal.pending_for_source(gui.excel_path) == []
 
 
 def test_result_updates_replace_the_same_row_after_a_late_reply(gui):

@@ -69,6 +69,45 @@ def test_delivered_scan_with_lost_response_is_reconciled_without_resending(tmp_p
     journal.close()
 
 
+def _journaled_runner(tmp_path, device):
+    work = runner(device)
+    work.journal = RunJournal(str(tmp_path / "journal.sqlite3"))
+    work.run_id = work.journal.create_run("key", "a.xlsx", "pick", {})
+    # PickWorker ghi dòng này trước khi gọi run_bill.
+    work.journal.begin(work.run_id, "bill", bill="OR1")
+    return work
+
+
+def _fail_typing_in(device, state):
+    original = device.run_shell
+    def lost(command, timeout=None):
+        return None if device.state == state and "input text" in command else original(command, timeout)
+    device.run_shell = lost
+
+
+def test_adb_lost_while_typing_the_or_code_leaves_nothing_to_reconcile(tmp_path):
+    device = FakePickDevice([Session("OR1", "PL1", 1)])
+    _fail_typing_in(device, "list")
+    work = _journaled_runner(tmp_path, device)
+    with pytest.raises(Exception, match="ADB"):
+        work.run_bill("OR1", [{"row": 2, "value": "S1"}])
+    assert work.journal.pending(work.run_id)          # chưa nhả thì còn nằm chờ
+    assert work.journal.release_untouched(run_id=work.run_id) == ["OR1"]
+    assert work.journal.pending(work.run_id) == []
+    work.journal.close()
+
+
+def test_adb_lost_after_opening_the_session_still_needs_reconciling(tmp_path):
+    device = FakePickDevice([Session("OR1", "PL1", 1)])
+    _fail_typing_in(device, "tote")
+    work = _journaled_runner(tmp_path, device)
+    with pytest.raises(Exception, match="ADB"):
+        work.run_bill("OR1", [{"row": 2, "value": "S1"}])
+    assert work.journal.release_untouched(run_id=work.run_id) == []
+    assert {op["bill"] for op in work.journal.pending(work.run_id)} == {"OR1"}
+    work.journal.close()
+
+
 def test_one_empty_xml_can_recover_within_same_deadline():
     device = FakePickDevice([])
     work = runner(device)

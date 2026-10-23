@@ -2068,7 +2068,8 @@ class BotGUI(QMainWindow):
         self._run_sheet = sheet
         key = fingerprint(self.excel_path, sheet, mode, rows, config)
         previous = self.journal.latest(key)
-        other_pending = [op for op in self.journal.pending_for_source(self.excel_path)
+        self._release_untouched_bills()
+        other_pending =[op for op in self.journal.pending_for_source(self.excel_path)
                          if not previous or op["run_id"] != previous["id"]]
         if other_pending:
             QMessageBox.warning(self, "Còn thao tác chưa đối chiếu",
@@ -2146,14 +2147,27 @@ class BotGUI(QMainWindow):
                     self.run_id, APP_VERSION, mode, self._get_selected_instances(), config)
         return selected
 
+    def _release_untouched_bills(self):
+        """
+        Mã dừng giữa chừng khi mới gõ ô tìm kiếm thì app chưa thấy nó: không có
+        gì để đối chiếu, và đánh dấu "đã đối chiếu" sẽ làm lượt sau bỏ qua mã đó.
+        """
+        released = self.journal.release_untouched(source=self.excel_path)
+        if released:
+            logger.info("Mã chưa mở phiên nào trên app, lượt này chạy lại từ đầu: %s", ", ".join(released))
+        return released
+
     def _review_unresolved_progress(self):
         if any(w.isRunning() for w in self.workers) or self._finishing or not self.excel_path:
             return
         if self.journal is None:
             self.journal = RunJournal()
+        released = self._release_untouched_bills()
         pending = self.journal.pending_for_source(self.excel_path)
         if not pending:
-            QMessageBox.information(self, "Tiến độ", "Không có thao tác đang chờ đối chiếu cho file này.")
+            note = (f"\n\n{len(released)} mã dừng trước khi mở phiên trên app nên không cần đối chiếu, "
+                    "lần chạy tới bot sẽ chạy lại các mã đó.") if released else ""
+            QMessageBox.information(self, "Tiến độ", "Không có thao tác đang chờ đối chiếu cho file này." + note)
             return
         import json
         details = "\n".join(f"Dòng {op['row'] or '-'} / {op['bill'] or '-'}: {op['kind']} {op['payload']}"

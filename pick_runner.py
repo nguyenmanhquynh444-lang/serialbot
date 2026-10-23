@@ -405,13 +405,14 @@ class PickRunner:
                 )
             self._poll()
 
-    def _tap_id(self, xml: str, resource_id: str) -> None:
+    def _tap_id(self, xml: str, resource_id: str, harmless: bool = False) -> None:
+        """`harmless`: chỉ chuyển màn hình/lấy focus ô nhập, chưa mở phiên hay đổi gì trên app."""
         if self._should_stop():
             raise PickStopped("Người dùng bấm Dừng.")
         node = first_with_id(xml, resource_id)
         if not node:
             raise self._stop(f"Không tìm thấy nút '{resource_id}' trên màn hình.")
-        self._tap_node(node, resource_id)
+        self._tap_node(node, resource_id, harmless)
 
     def _tap_dismiss(self, button: dict) -> None:
         """
@@ -423,10 +424,13 @@ class PickRunner:
         """
         self._tap_node(button, button.get("resource_id") or button.get("text", ""))
 
-    def _tap_node(self, node: dict, name: str) -> None:
+    def _tap_node(self, node: dict, name: str, harmless: bool = False) -> None:
         if self._should_stop():
             raise PickStopped("Người dùng bấm Dừng.")
-        operation = self._begin_operation("tap", payload={"resource_id": name})
+        # Mã dừng giữa chừng mà mọi lần chạm đều vô hại thì chưa có gì để đối
+        # chiếu trên app - xem RunJournal.release_untouched.
+        payload = {"resource_id": name, **({"harmless": True} if harmless else {})}
+        operation = self._begin_operation("tap", payload=payload)
         deadline = getattr(self, "_active_deadline", None) or time.monotonic() + self.config.step_timeout
         self._check_wait(deadline)
         with adb_budget(self.adb, deadline):
@@ -559,7 +563,7 @@ class PickRunner:
                 return
 
             if first_with_id(xml, RID_PICK_MENU):
-                self._tap_id(xml, RID_PICK_MENU)
+                self._tap_id(xml, RID_PICK_MENU, harmless=True)
                 self._wait_for_search_screen()
                 return
 
@@ -658,7 +662,7 @@ class PickRunner:
                     self._log(
                         f"[{bill}] ô tìm kiếm còn '{typed}' - chạm vào ô rồi gõ lại"
                     )
-                    self._tap_id(xml, RID_INPUT)
+                    self._tap_id(xml, RID_INPUT, harmless=True)
                     self._type(bill, xml)
                     retried = True
                     stale_since = None

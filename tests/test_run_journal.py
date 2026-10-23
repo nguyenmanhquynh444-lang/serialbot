@@ -28,6 +28,50 @@ def test_complete_bill_and_clear_intentions_commit_together(tmp_path):
     journal.close()
 
 
+def test_bill_that_only_typed_the_search_code_is_released(tmp_path):
+    journal = RunJournal(str(tmp_path / "ledger.sqlite3"))
+    run = journal.create_run("key", "a.xlsx", "pick", {})
+    journal.begin(run, "bill", bill="OR1", payload={"rows": []})
+    journal.begin(run, "tap", bill="OR1", payload={"resource_id": "btnPick", "harmless": True})
+    journal.begin(run, "input", bill="OR1", payload={"text": "OR1"})
+    assert journal.release_untouched(run_id=run) == ["OR1"]
+    assert journal.pending(run) == []
+    journal.close()
+
+
+def test_bill_that_may_have_changed_the_app_stays_pending(tmp_path):
+    journal = RunJournal(str(tmp_path / "ledger.sqlite3"))
+    run = journal.create_run("key", "a.xlsx", "pick", {})
+    # OR2 đã chạm nút mở phiên; OR3 chạm một nút không đánh dấu (nhật ký cũ);
+    # OR4 đã có serial gửi đi. Cả ba đều phải đợi người xem.
+    for bill, extra in (("OR2", ("tap", None, {"resource_id": "btnProceed"})),
+                        ("OR3", ("tap", None, {"resource_id": "btnPick"})),
+                        ("OR4", ("scan", 5, {"serial": "S"}))):
+        journal.begin(run, "bill", bill=bill)
+        journal.begin(run, "input", bill=bill, payload={"text": bill})
+        kind, row, payload = extra
+        journal.begin(run, kind, row=row, bill=bill, payload=payload)
+    journal.begin(run, "bill", bill="OR5")
+    journal.begin(run, "input", bill="OR5", payload={"text": "OR5"})
+    assert journal.release_untouched(run_id=run) == ["OR5"]
+    assert {op["bill"] for op in journal.pending(run)} == {"OR2", "OR3", "OR4"}
+    journal.close()
+
+
+def test_release_untouched_by_source_ignores_serial_rows(tmp_path):
+    journal = RunJournal(str(tmp_path / "ledger.sqlite3"))
+    serial_run = journal.create_run("k1", "a.xlsx", "serial", {})
+    pick_run = journal.create_run("k2", "a.xlsx", "pick", {})
+    other = journal.create_run("k3", "b.xlsx", "pick", {})
+    journal.begin(serial_run, "serial", row=2, payload={"serial": "S1"})
+    journal.begin(pick_run, "bill", bill="OR1")
+    journal.begin(other, "bill", bill="OR9")
+    assert journal.release_untouched(source="a.xlsx") == ["OR1"]
+    assert len(journal.pending(serial_run)) == 1
+    assert len(journal.pending(other)) == 1
+    journal.close()
+
+
 def test_fingerprint_matches_selected_data_not_workbook_bytes(tmp_path):
     args = (str(tmp_path / "a.xlsx"), "Data", "serial", [{"row": 2, "value": "S1"}], {"enter": "enter"})
     first = fingerprint(*args)

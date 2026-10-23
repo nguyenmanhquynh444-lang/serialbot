@@ -126,7 +126,7 @@ class InboundRunner(PickRunner):
                 return
 
             if first_with_id(xml, RID_RECEIVE_MENU):
-                self._tap_id(xml, RID_RECEIVE_MENU)
+                self._tap_id(xml, RID_RECEIVE_MENU, harmless=True)
                 self._wait_for_id(RID_INPUT)
                 return
 

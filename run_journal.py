@@ -21,6 +21,27 @@ def fingerprint(source, sheet, mode, selected, config):
     return hashlib.sha256(wire.encode("utf-8")).hexdigest()
 
 
+def _changes_nothing_on_app(op):
+    """
+    Thao tác chưa làm đổi gì trên app: mở đầu một mã, gõ vào ô nhập, hoặc chạm
+    điều hướng (runner đánh dấu `harmless`). Quét serial (có dòng) và mọi lần
+    chạm còn lại - nhất là nút mở phiên - thì không.
+
+    Gõ vào ô nhập vẫn tính là vô hại vì mọi lần gõ trong phiên đều đi sau một
+    lần chạm mở phiên, mà lần chạm đó đã đủ để cả mã bị coi là đã đụng vào app.
+    """
+    if op["row"] is not None:
+        return False
+    if op["kind"] in ("bill", "input"):
+        return True
+    if op["kind"] == "tap":
+        try:
+            return bool(json.loads(op["payload"]).get("harmless"))
+        except (TypeError, ValueError, AttributeError):
+            return False
+    return False
+
+
 class RunJournal:
     def __init__(self, path=None):
         self.path = path or journal_path()
@@ -96,6 +117,33 @@ class RunJournal:
                 "JOIN runs r ON r.id=o.run_id WHERE r.source=? AND o.state='pending' ORDER BY o.id",
                 (os.path.normcase(os.path.abspath(source)),)).fetchall()
         return [dict(zip(("id", "kind", "row", "bill", "payload", "run_id"), row)) for row in rows]
+
+    def release_untouched(self, run_id=None, source=None):
+        """
+        Nhả khỏi danh sách chờ đối chiếu những mã chưa chạm tới phiên nào trên app.
+
+        Dừng giữa chừng lúc mới gõ mã tìm kiếm (ADB hụt) để lại đúng hai thao
+        tác 'bill' + 'input' ở trạng thái chờ. Chưa mở hay quét gì nên không có
+        gì để đối chiếu; bắt người dùng "đối chiếu" thì mã đó bị ghi chưa xác
+        minh và bỏ qua luôn dù app chưa hề thấy nó. Nhả ra thì lượt sau làm lại
+        mã đó từ đầu.
+
+        Chỉ cần một thao tác có thể đã đổi trạng thái app (chạm nút mở phiên,
+        quét serial) là cả mã vẫn nằm lại chờ người xem. Trả về các mã đã nhả.
+        """
+        pending = self.pending(run_id) if run_id else self.pending_for_source(source)
+        by_bill = {}
+        for op in pending:
+            by_bill.setdefault((op.get("run_id", run_id), op["bill"]), []).append(op)
+        released, ids = [], []
+        for (_, bill), ops in by_bill.items():
+            if bill and all(_changes_nothing_on_app(op) for op in ops):
+                released.append(bill)
+                ids.extend(op["id"] for op in ops)
+        if ids:
+            with self._lock, self._db:
+                self._db.executemany("UPDATE operations SET state='aborted' WHERE id=?", [(i,) for i in ids])
+        return released
 
     def record_result(self, run_id, result, operation=None):
         with self._lock, self._db:
