@@ -342,6 +342,6 @@ class InboundRunner(PickRunner):
                     raise self._stop(f"[{bill}] hộp thoại {kind}: {dialog_message(xml)}")
                 self._completion_seen = True
                 self._log(f"[{bill}] kết thúc phiếu: {dialog_message(xml)}")
-                self._tap_id(xml, button["resource_id"])
+                self._tap_dismiss(button)
             xml = ""
             self._poll()

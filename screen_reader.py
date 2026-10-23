@@ -275,6 +275,13 @@ def _dialog_container(root):
         if 0 < _node_bounds_area(node) < screen_area * _DIALOG_MAX_SCREEN_RATIO:
             container = node
 
+    if container is not None and not _has_plain_text(container):
+        # Hộp thoại có hàng nút riêng ([Lịch sử][OK]) và bản dump chỉ có cửa sổ
+        # hộp thoại: hàng nút nhỏ hơn "màn hình" nên lọt ngưỡng, còn thẻ bao
+        # ngoài to đúng bằng bản dump nên bị loại. Khoanh vào hàng nút thì chỉ
+        # còn nhãn của nút kia - câu thông báo và bảng chi tiết rơi hết.
+        container = None
+
     if container is None and ancestors:
         # uiautomator nhiều khi chỉ dump riêng cửa sổ hộp thoại chứ không dump cả
         # màn hình. Lúc đó tổ tiên nào cũng to đúng bằng "màn hình" nên không cái
@@ -283,6 +290,16 @@ def _dialog_container(root):
         # tài khoản, thời gian) đều rơi mất, chỉ còn đúng một câu.
         container = ancestors[-1]
     return container
+
+
+def _has_plain_text(container) -> bool:
+    """`container` có dòng chữ nào không phải nhãn của một nút bấm không."""
+    return any(
+        _element_label(node)
+        and node.get("clickable") != "true"
+        and normalize_match_text(_element_label(node)) not in DISMISS_LABELS
+        for node in container.iter("node")
+    )
 
 
 def _element_label(node) -> str:

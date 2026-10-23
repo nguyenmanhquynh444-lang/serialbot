@@ -17,6 +17,12 @@ import re
 
 SCREEN = (0, 0, 720, 1280)
 
+# Hộp thoại cuối phiên của bản app mới (dump chỉ có cửa sổ hộp thoại): bảng chi tiết
+# và hàng nút [Lịch sử][OK] nằm trong khối riêng, nhỏ hơn thẻ bao ngoài.
+FINISH_CARD = (54, 430, 666, 898)
+FINISH_HISTORY_BOUNDS = (54, 798, 360, 898)
+FINISH_OK_BOUNDS = (360, 798, 666, 898)
+
 
 def _node(rid="", text="", bounds=(0, 0, 0, 0), clickable=False, cls="android.widget.TextView"):
     x1, y1, x2, y2 = bounds
@@ -37,6 +43,11 @@ def _screen(nodes, root=SCREEN):
         f'content-desc="" clickable="false" bounds="[{x1},{y1}][{x2},{y2}]">'
         f"{inner}</node></hierarchy>"
     )
+
+
+def _inside(x, y, bounds) -> bool:
+    x1, y1, x2, y2 = bounds
+    return x1 <= x <= x2 and y1 <= y <= y2
 
 
 class Session:
@@ -64,6 +75,10 @@ class FakePickDevice:
     totes_needed    - số thiết bị chứa hàng phải đăng ký cho mỗi lượt làm việc.
                       App nhớ tote giữa các phiên, nên đăng ký đủ một lần là từ
                       phiên sau màn hình quét tote tự lướt qua.
+    finish_layout   - hộp thoại cuối phiên: "legacy" (câu + hai nút liền nhau),
+                      "new" (bản app mới, có bảng chi tiết và hàng nút riêng),
+                      "new_ok_without_id" (như "new" nhưng nút OK không có id)
+    finish_after    - app đóng phiên sau chừng này serial dù chưa đủ số lượng
     """
 
     def __init__(
@@ -73,12 +88,17 @@ class FakePickDevice:
         skip_assistant=False,
         stuck_dialog="",
         totes_needed=1,
+        finish_layout="legacy",
+        finish_after=0,
     ):
         self.sessions = list(sessions)
         self.reject_serials = set(reject_serials)
         self.skip_assistant = skip_assistant
         self.stuck_dialog = stuck_dialog
         self.totes_needed = totes_needed
+        self.finish_layout = finish_layout
+        self.finish_after = finish_after
+        self.history_opened = False
 
         self.state = "menu"
         self.filter_text = ""
@@ -171,6 +191,9 @@ class FakePickDevice:
                 _node("actionFinish", "Bỏ qua", (650, 48, 720, 107), True),
             ])
 
+        if self.state == "finish" and self.finish_layout != "legacy":
+            return self._finish_dialog_xml()
+
         if self.state == "finish":
             return _screen([
                 _node("message", "Công việc lấy hàng đã kết thúc", (60, 560, 660, 640)),
@@ -179,6 +202,31 @@ class FakePickDevice:
             ], root=(54, 540, 666, 776))
 
         raise AssertionError(f"trang thai la: {self.state}")
+
+    def _finish_dialog_xml(self) -> str:
+        ok_rid = "" if self.finish_layout == "new_ok_without_id" else "btnOk"
+        session = self.active.code
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?><hierarchy rotation="0">'
+            f'<node text="" resource-id="" class="android.widget.FrameLayout" content-desc="" '
+            f'clickable="false" bounds="[{FINISH_CARD[0]},{FINISH_CARD[1]}][{FINISH_CARD[2]},{FINISH_CARD[3]}]">'
+            '<node text="" resource-id="" class="android.widget.LinearLayout" content-desc="" '
+            f'clickable="false" bounds="[{FINISH_CARD[0]},{FINISH_CARD[1]}][{FINISH_CARD[2]},{FINISH_CARD[3]}]">'
+            + _node("", "Thông báo", (54, 430, 666, 500))
+            + _node("", "Công việc lấy hàng đã kết thúc", (70, 520, 650, 560))
+            + _node("", "Mã phiên", (70, 600, 250, 640))
+            + _node("", session, (260, 600, 650, 640))
+            + _node("", "Tài khoản", (70, 660, 250, 700))
+            + _node("", "ntl.0000000", (260, 660, 650, 700))
+            + _node("", "Thời gian", (70, 720, 250, 760))
+            + _node("", "09:41:11 23/10/2026", (260, 720, 650, 760))
+            + '<node text="" resource-id="" class="android.widget.LinearLayout" content-desc="" '
+            f'clickable="false" bounds="[{FINISH_HISTORY_BOUNDS[0]},{FINISH_HISTORY_BOUNDS[1]}]'
+            f'[{FINISH_OK_BOUNDS[2]},{FINISH_OK_BOUNDS[3]}]">'
+            + _node("btnHistory", "Lịch sử", FINISH_HISTORY_BOUNDS, True, "android.widget.Button")
+            + _node(ok_rid, "OK", FINISH_OK_BOUNDS, True, "android.widget.Button")
+            + '</node></node></node></hierarchy>'
+        )
 
     # --------------------------------------------------------------- lệnh adb
 
@@ -241,12 +289,20 @@ class FakePickDevice:
                 self.state = "tote" if self.skip_assistant else "assistant"
         elif self.state == "assistant" and self._hit(x, y, "button2"):
             self.state = "tote"
-        elif self.state == "finish" and self._hit(x, y, "button1"):
-            # App trả về màn hình tìm mã OR chứ không về menu chính, và giữ
-            # nguyên mã cũ trong ô tìm kiếm.
-            self.active.done = True
-            self.state = "list"
-            self.active = None
+        elif self.state == "finish":
+            if self.finish_layout == "legacy":
+                ok, history = self._hit(x, y, "button1"), self._hit(x, y, "button2")
+            else:
+                ok = _inside(x, y, FINISH_OK_BOUNDS)
+                history = _inside(x, y, FINISH_HISTORY_BOUNDS)
+            if history:
+                self.history_opened = True
+            elif ok:
+                # App trả về màn hình tìm mã OR chứ không về menu chính, và giữ
+                # nguyên mã cũ trong ô tìm kiếm.
+                self.active.done = True
+                self.state = "list"
+                self.active = None
 
     def _type(self, text):
         self.typed.append((self.state, text))
@@ -265,5 +321,7 @@ class FakePickDevice:
                 self.state = "error_dialog"
                 return
             self.picked += 1
-            if self.picked >= self.active.product_qty:
+            if self.picked >= self.active.product_qty or (
+                self.finish_after and self.picked >= self.finish_after
+            ):
                 self.state = "finish"

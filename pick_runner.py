@@ -411,12 +411,27 @@ class PickRunner:
         node = first_with_id(xml, resource_id)
         if not node:
             raise self._stop(f"Không tìm thấy nút '{resource_id}' trên màn hình.")
-        operation = self._begin_operation("tap", payload={"resource_id": resource_id})
+        self._tap_node(node, resource_id)
+
+    def _tap_dismiss(self, button: dict) -> None:
+        """
+        Chạm vào đúng nút `find_dismiss_button` đã chọn, theo toạ độ của nó.
+
+        Không dò lại theo resource-id: nút OK của hộp thoại mới không đảm bảo có
+        id, và hai nút [Lịch sử][OK] mà dùng chung một id thì `first_with_id` sẽ
+        trả nút đứng trước - tức là mở Lịch sử thay vì đóng hộp thoại.
+        """
+        self._tap_node(button, button.get("resource_id") or button.get("text", ""))
+
+    def _tap_node(self, node: dict, name: str) -> None:
+        if self._should_stop():
+            raise PickStopped("Người dùng bấm Dừng.")
+        operation = self._begin_operation("tap", payload={"resource_id": name})
         deadline = getattr(self, "_active_deadline", None) or time.monotonic() + self.config.step_timeout
         self._check_wait(deadline)
         with adb_budget(self.adb, deadline):
             if not self.screen.tap_node(node):
-                raise self._stop(f"Gửi lệnh chạm '{resource_id}' thất bại.")
+                raise self._stop(f"Gửi lệnh chạm '{name}' thất bại.")
         # Keep the intention pending until the whole bill is verified closed.
 
     def _type(self, text: str, xml: str = "", deadline=None) -> None:
@@ -888,7 +903,7 @@ class PickRunner:
                     if self._counter_total is not None and previous + 1 != self._counter_total:
                         raise self._stop(f"[{bill}] kết thúc trước khi bộ đếm đủ tổng đã xác nhận.")
                     if kind == "placement":
-                        self._tap_id(xml, find_dismiss_button(xml)["resource_id"])
+                        self._tap_dismiss(find_dismiss_button(xml))
                         self._poll()
                         continue
                     self._pending_finish_xml = xml
@@ -931,7 +946,7 @@ class PickRunner:
                     raise self._stop(f"[{bill}] hộp thoại {kind} khi đóng phiên: {dialog_message(xml)}")
                 self._completion_seen |= kind == "complete"
                 self._log(f"[{bill}] kết thúc phiên: {dialog_message(xml)}")
-                self._tap_id(xml, button["resource_id"])
+                self._tap_dismiss(button)
             if time.monotonic() >= deadline:
                 raise self._stop(f"[{bill}] quét đủ serial nhưng không về được màn hình tìm mã OR.")
             xml = ""
