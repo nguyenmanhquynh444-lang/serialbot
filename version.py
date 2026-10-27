@@ -5,7 +5,7 @@ QSettings scoping and the PyInstaller version resource.
 """
 
 APP_NAME = "Serial Paste Bot"
-APP_VERSION = "2.2.3"
+APP_VERSION = "2.2.4"
 APP_ORG = "SerialBotOrg"
 APP_DESCRIPTION = "Kiểm đếm serial tự động từ Excel vào LDPlayer"
 APP_COPYRIGHT = "© 2026"
