@@ -275,7 +275,7 @@ def _dialog_container(root):
         if 0 < _node_bounds_area(node) < screen_area * _DIALOG_MAX_SCREEN_RATIO:
             container = node
 
-    if container is not None and not _has_plain_text(container):
+    if container is not None and not _has_plain_text(container, parents):
         # Hộp thoại có hàng nút riêng ([Lịch sử][OK]) và bản dump chỉ có cửa sổ
         # hộp thoại: hàng nút nhỏ hơn "màn hình" nên lọt ngưỡng, còn thẻ bao
         # ngoài to đúng bằng bản dump nên bị loại. Khoanh vào hàng nút thì chỉ
@@ -292,14 +292,31 @@ def _dialog_container(root):
     return container
 
 
-def _has_plain_text(container) -> bool:
-    """`container` có dòng chữ nào không phải nhãn của một nút bấm không."""
-    return any(
-        _element_label(node)
-        and node.get("clickable") != "true"
-        and normalize_match_text(_element_label(node)) not in DISMISS_LABELS
-        for node in container.iter("node")
-    )
+def _has_plain_text(container, parents) -> bool:
+    """
+    `container` có dòng chữ nào không phải nhãn của một nút bấm không.
+
+    Nhãn nút có thể nằm ở chính nút bấm được, hoặc ở một ô chữ con không bấm
+    được bên trong ô cha bấm được (tuỳ máy báo `clickable` ở đâu) - nên phải xét
+    cả chuỗi tổ tiên bên trong `container`, không chỉ riêng node chứa chữ.
+    """
+    for node in container.iter("node"):
+        if not _element_label(node):
+            continue
+        if normalize_match_text(_element_label(node)) in DISMISS_LABELS:
+            continue
+        if not _inside_clickable(node, container, parents):
+            return True
+    return False
+
+
+def _inside_clickable(node, container, parents) -> bool:
+    """`node` hoặc một tổ tiên của nó (không tính `container`) bấm được."""
+    while node is not None and node is not container:
+        if node.get("clickable") == "true":
+            return True
+        node = parents.get(node)
+    return False
 
 
 def _element_label(node) -> str:

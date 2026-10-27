@@ -1981,6 +1981,7 @@ class BotGUI(QMainWindow):
         )
         if screenshot_path:
             text += f"\n\nẢnh màn hình lúc dừng:\n{screenshot_path}"
+        text += f"\n\nPhiên bản: {APP_VERSION}"
 
         self._set_tray_state("error")
         QMessageBox.critical(self, "Phiên chạy đã dừng", text)

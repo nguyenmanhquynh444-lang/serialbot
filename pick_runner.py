@@ -985,7 +985,10 @@ class PickRunner:
                     self._completion_seen = kind == "complete"
                     self._scan_xml = ""
                     return previous + 1
-                raise self._stop(f"[{bill}] serial '{serial}': hộp thoại {kind} - {dialog_message(xml)}")
+                raise self._stop(
+                    f"[{bill}] serial '{serial}': hộp thoại {kind} - {dialog_message(xml)}"
+                    + self._unknown_dialog_detail(kind, xml)
+                )
             counter = parse_counter((first_with_id(xml, RID_COUNTER) or {}).get("text", ""))
             if counter:
                 current, total = counter
@@ -1018,7 +1021,10 @@ class PickRunner:
             if button:
                 kind = classify_session_dialog(xml, self.session_mode)
                 if kind not in ("complete", "placement"):
-                    raise self._stop(f"[{bill}] hộp thoại {kind} khi đóng phiên: {dialog_message(xml)}")
+                    raise self._stop(
+                        f"[{bill}] hộp thoại {kind} khi đóng phiên: {dialog_message(xml)}"
+                        + self._unknown_dialog_detail(kind, xml)
+                    )
                 self._completion_seen |= kind == "complete"
                 self._log(f"[{bill}] kết thúc phiên: {dialog_message(xml)}")
                 self._tap_dismiss(button)
@@ -1026,6 +1032,16 @@ class PickRunner:
                 raise self._stop(f"[{bill}] quét đủ serial nhưng không về được màn hình tìm mã OR.")
             xml = ""
             self._poll()
+
+    def _unknown_dialog_detail(self, kind: str, xml: str) -> str:
+        """
+        Hộp thoại bot không nhận ra thì kèm danh sách phần tử màn hình: bản dump
+        nằm ở máy client, nên chữ trong thông báo là thứ duy nhất tới được tay
+        người sửa. Hộp thoại lỗi đã có câu app báo, không cần thêm.
+        """
+        if kind != "unknown":
+            return ""
+        return "\nPhần tử trên màn hình: " + self._describe(xml, limit=30)
 
     @staticmethod
     def _describe(xml: str, limit: int = 12) -> str:

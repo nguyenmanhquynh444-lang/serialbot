@@ -77,7 +77,9 @@ class FakePickDevice:
                       phiên sau màn hình quét tote tự lướt qua.
     finish_layout   - hộp thoại cuối phiên: "legacy" (câu + hai nút liền nhau),
                       "new" (bản app mới, có bảng chi tiết và hàng nút riêng),
-                      "new_ok_without_id" (như "new" nhưng nút OK không có id)
+                      "new_ok_without_id" (như "new" nhưng nút OK không có id),
+                      "new_clickable_parent" (chữ nút nằm trong ô con không bấm được
+                      của một ô cha bấm được - tuỳ máy báo `clickable` ở đâu)
     finish_after    - app đóng phiên sau chừng này serial dù chưa đủ số lượng
     """
 
@@ -223,10 +225,27 @@ class FakePickDevice:
             + '<node text="" resource-id="" class="android.widget.LinearLayout" content-desc="" '
             f'clickable="false" bounds="[{FINISH_HISTORY_BOUNDS[0]},{FINISH_HISTORY_BOUNDS[1]}]'
             f'[{FINISH_OK_BOUNDS[2]},{FINISH_OK_BOUNDS[3]}]">'
-            + _node("btnHistory", "Lịch sử", FINISH_HISTORY_BOUNDS, True, "android.widget.Button")
-            + _node(ok_rid, "OK", FINISH_OK_BOUNDS, True, "android.widget.Button")
+            + self._finish_buttons_xml(ok_rid)
             + '</node></node></node></hierarchy>'
         )
+
+    def _finish_buttons_xml(self, ok_rid: str) -> str:
+        if self.finish_layout != "new_clickable_parent":
+            return (
+                _node("btnHistory", "Lịch sử", FINISH_HISTORY_BOUNDS, True, "android.widget.Button")
+                + _node(ok_rid, "OK", FINISH_OK_BOUNDS, True, "android.widget.Button")
+            )
+
+        def button(rid, text, bounds):
+            x1, y1, x2, y2 = bounds
+            return (
+                f'<node text="" resource-id="vn.app:id/{rid}" class="android.widget.LinearLayout" '
+                f'content-desc="" clickable="true" bounds="[{x1},{y1}][{x2},{y2}]">'
+                + _node("", text, (x1 + 60, y1 + 30, x2 - 60, y2 - 30))
+                + '</node>'
+            )
+
+        return button("btnHistory", "Lịch sử", FINISH_HISTORY_BOUNDS) + button(ok_rid, "OK", FINISH_OK_BOUNDS)
 
     # --------------------------------------------------------------- lệnh adb
 

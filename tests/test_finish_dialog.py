@@ -17,7 +17,7 @@ import pytest
 from automation_backend import AdbBackend
 from fake_pick_device import FakePickDevice, Session
 from pick_runner import PickConfig, PickRunner, PickStopped
-from screen_reader import dialog_marker, dialog_message, find_dismiss_button
+from screen_reader import dialog_marker, dialog_message, find_dismiss_button, parse_bounds
 from verification import classify_session_dialog
 
 
@@ -77,7 +77,33 @@ FINISH_OK_WITHOUT_ID_XML = (
     + '</node></hierarchy>'
 )
 
+# Chữ nút nằm trong TextView con KHÔNG bấm được của một LinearLayout cha bấm được.
+# Máy nào báo `clickable` ở cha thì bản sửa đầu tiên vẫn khoanh nhầm vào hàng nút
+# và bot báo "hộp thoại unknown - Lịch sử" y như lỗi cũ.
+FINISH_CLICKABLE_PARENT_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?><hierarchy rotation="0">'
+    '<node class="android.widget.FrameLayout" bounds="[54,645][1026,1347]">'
+    '<node class="android.widget.LinearLayout" bounds="[54,645][1026,1347]">'
+    '<node text="Thông báo" bounds="[192,681][450,754]"/>'
+    '<node text="Công việc lấy hàng đã kết thúc" bounds="[102,832][978,893]"/>'
+    '<node text="Mã phiên" bounds="[102,944][390,997]"/>'
+    '<node text="PL00000000TEST_001" bounds="[390,944][978,997]"/>'
+    '<node text="Tài khoản" bounds="[102,1015][390,1068]"/>'
+    '<node text="ntl.0000000" bounds="[390,1015][978,1068]"/>'
+    '<node text="Thời gian" bounds="[102,1086][390,1139]"/>'
+    '<node text="09:41:11 23/10/2026" bounds="[390,1086][978,1139]"/>'
+    '<node class="android.widget.LinearLayout" bounds="[54,1198][1026,1347]">'
+    '<node class="android.widget.LinearLayout" clickable="true" bounds="[54,1198][539,1347]">'
+    '<node class="android.widget.TextView" text="Lịch sử" clickable="false" '
+    'bounds="[200,1240][400,1300]"/></node>'
+    '<node class="android.widget.LinearLayout" clickable="true" bounds="[541,1198][1026,1347]">'
+    '<node class="android.widget.TextView" text="OK" clickable="false" '
+    'bounds="[700,1240][860,1300]"/></node>'
+    '</node></node></node></hierarchy>'
+)
+
 ALL_LAYOUTS = [
+    pytest.param(FINISH_CLICKABLE_PARENT_XML, id="clickable-parent"),
     pytest.param(FINISH_DIALOG_ONLY_XML, id="dialog-only"),
     pytest.param(FINISH_OVER_PAGE_XML, id="over-page"),
     pytest.param(FINISH_OK_WITHOUT_ID_XML, id="ok-without-id"),
@@ -109,7 +135,28 @@ def test_ok_is_the_button_to_dismiss_never_history(xml):
     button = find_dismiss_button(xml)
 
     assert button["text"] == "OK"
-    assert button["bounds"] == "[540,1197][1026,1347]"
+    # Chạm vào giữa nhãn phải rơi vào nửa phải của hàng nút (OK), không phải nửa
+    # trái (Lịch sử). Với ô chữ con trong ô cha bấm được, nhãn nhỏ hơn cả nút.
+    x1, y1, x2, y2 = parse_bounds(button["bounds"])
+    assert (x1 + x2) // 2 > 540 and 1197 <= (y1 + y2) // 2 <= 1347
+
+
+def test_classification_does_not_depend_on_where_the_dialog_was_cut_out(monkeypatch):
+    """
+    Dù cách khoanh hộp thoại đọc sai (ở đây ép nó chỉ trả "Lịch sử"), câu báo kết
+    thúc phiên vẫn nằm trên màn hình nên vẫn phải nhận ra là kết thúc.
+    """
+    import verification
+
+    monkeypatch.setattr(verification, "dialog_message", lambda xml, max_len=300: "Lịch sử")
+
+    assert verification.classify_session_dialog(FINISH_DIALOG_ONLY_XML, "pick") == "complete"
+
+
+def test_the_whole_screen_fallback_does_not_turn_other_dialogs_into_complete():
+    xml = FINISH_CLICKABLE_PARENT_XML.replace("Công việc lấy hàng đã kết thúc", "Chờ xác nhận")
+
+    assert classify_session_dialog(xml, "pick") == "unknown"
 
 
 def test_marker_is_the_end_sentence():
@@ -135,7 +182,7 @@ def make_runner(device):
     return PickRunner(device, AdbBackend(device), config, on_log=None)
 
 
-@pytest.mark.parametrize("layout", ["new", "new_ok_without_id"])
+@pytest.mark.parametrize("layout", ["new", "new_ok_without_id", "new_clickable_parent"])
 def test_bill_closes_on_the_new_end_of_session_dialog(layout):
     device = FakePickDevice([Session("OR1", "PL_001", 2)], finish_layout=layout)
 
@@ -171,3 +218,18 @@ def test_the_new_dialog_before_the_last_serial_still_stops_the_run():
         make_runner(device).run_bill("OR1", [
             {"row": 2, "value": "S1"}, {"row": 3, "value": "S2"}, {"row": 4, "value": "S3"},
         ])
+
+
+def test_unknown_dialog_stop_lists_the_screen_elements_for_the_bug_report():
+    device = FakePickDevice([Session("OR1", "PL_001", 1)], finish_layout="new")
+    original = device._finish_dialog_xml
+    device._finish_dialog_xml = lambda: original().replace(
+        "Công việc lấy hàng đã kết thúc", "Hộp thoại lạ chưa gặp bao giờ"
+    )
+
+    with pytest.raises(PickStopped) as stopped:
+        make_runner(device).run_bill("OR1", [{"row": 2, "value": "S1"}])
+
+    assert "hộp thoại unknown" in stopped.value.message
+    assert "Phần tử trên màn hình:" in stopped.value.message
+    assert "Hộp thoại lạ chưa gặp bao giờ" in stopped.value.message
