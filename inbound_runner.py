@@ -92,8 +92,11 @@ class InboundRunner(PickRunner):
         self._pending_finish_xml = ""
         self._log(f"[{bill}] mở danh sách check-in")
 
-        self._open_checkin_list()
-        outcome.session_code = self._search_and_open(bill)
+        def open_session():
+            self._open_checkin_list()
+            return self._search_and_open(bill)
+
+        outcome.session_code = self._open_with_adb_retry(bill, open_session)
         outcome.serials = self._scan_serials(bill, rows)
         outcome.picked = sum(1 for s in outcome.serials if s.status == "OK")
         self._finish_session(bill)

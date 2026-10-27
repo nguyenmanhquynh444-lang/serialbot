@@ -69,8 +69,9 @@ def test_delivered_scan_with_lost_response_is_reconciled_without_resending(tmp_p
     journal.close()
 
 
-def _journaled_runner(tmp_path, device):
-    work = runner(device)
+def _journaled_runner(tmp_path, device, **kwargs):
+    kwargs.setdefault("adb_retry_delays", (0, 0))
+    work = runner(device, **kwargs)
     work.journal = RunJournal(str(tmp_path / "journal.sqlite3"))
     work.run_id = work.journal.create_run("key", "a.xlsx", "pick", {})
     # PickWorker ghi dòng này trước khi gọi run_bill.
@@ -95,6 +96,83 @@ def test_adb_lost_while_typing_the_or_code_leaves_nothing_to_reconcile(tmp_path)
     assert work.journal.release_untouched(run_id=work.run_id) == ["OR1"]
     assert work.journal.pending(work.run_id) == []
     work.journal.close()
+
+
+def _fail_first(device, matches, times):
+    """`times` lệnh đầu khớp `matches(command)` thì ADB hụt: lệnh tới app, câu trả lời mất."""
+    original, left = device.run_shell, [times]
+    def flaky(command, timeout=None):
+        hit = matches(command) and left[0] > 0
+        output = original(command, timeout)
+        if hit:
+            left[0] -= 1
+            return None
+        return output
+    device.run_shell = flaky
+
+
+def test_adb_lost_while_typing_the_or_code_is_retried_until_it_works(tmp_path):
+    device = FakePickDevice([Session("OR1", "PL1", 1)])
+    _fail_first(device, lambda c: device.state == "list" and "input text" in c, 2)
+    work = _journaled_runner(tmp_path, device, adb_retry_delays=(0, 0, 0))
+
+    outcome = work.run_bill("OR1", [{"row": 2, "value": "S1"}])
+
+    assert outcome.picked == 1
+    assert [text for state, text in device.typed if state == "list"] == ["OR1"] * 3
+    assert [text for state, text in device.typed if state == "serial"] == ["S1"]
+    work.journal.close()
+
+
+def test_adb_retry_gives_up_with_a_clear_message_and_nothing_to_reconcile(tmp_path):
+    device = FakePickDevice([Session("OR1", "PL1", 1)])
+    _fail_typing_in(device, "list")
+    work = _journaled_runner(tmp_path, device, adb_retry_delays=(0, 0))
+
+    with pytest.raises(PickStopped, match="đã thử lại 2 lần"):
+        work.run_bill("OR1", [{"row": 2, "value": "S1"}])
+
+    assert device.active is None                      # chưa mở phiên nào
+    assert work.journal.release_untouched(run_id=work.run_id) == ["OR1"]
+    work.journal.close()
+
+
+def test_adb_lost_on_the_open_session_tap_is_never_retried(tmp_path):
+    """Chạm nút mở phiên mà mất phản hồi: phiên có thể đã mở - không làm lại."""
+    device = FakePickDevice([Session("OR1", "PL1", 1)])
+    _fail_first(device, lambda c: device.state == "list" and c.startswith("input tap"), 1)
+    work = _journaled_runner(tmp_path, device, adb_retry_delays=(0, 0, 0))
+
+    with pytest.raises(PickStopped, match="có thể đã mở"):
+        work.run_bill("OR1", [{"row": 2, "value": "S1"}])
+
+    assert [text for state, text in device.typed if state == "list"] == ["OR1"]
+    assert work.journal.release_untouched(run_id=work.run_id) == []
+    work.journal.close()
+
+
+def test_stop_during_the_adb_retry_wait_exits_at_once():
+    device = FakePickDevice([Session("OR1", "PL1", 1)])
+    _fail_typing_in(device, "list")
+    stop_at = time.monotonic() + 0.3
+    work = PickRunner(device, AdbBackend(device),
+                      PickConfig(step_timeout=.15, capture_screenshot=False, adb_retry_delays=(30,)),
+                      should_stop=lambda: time.monotonic() > stop_at)
+    started = time.monotonic()
+    with pytest.raises(PickStopped, match="Dừng"):
+        work.run_bill("OR1", [{"row": 2, "value": "S1"}])
+    assert time.monotonic() - started < 2
+
+
+def test_inbound_adb_lost_while_typing_the_code_is_retried():
+    device = FakeInboundDevice([Checkin("CK1", "IR1", 1)])
+    _fail_first(device, lambda c: device.state == "list" and "input text" in c, 1)
+    work = runner(device, InboundRunner, adb_retry_delays=(0,))
+
+    outcome = work.run_bill("CK1", [{"row": 2, "value": "S1"}])
+
+    assert outcome.picked == 1
+    assert [text for state, text in device.typed if state == "list"] == ["CK1", "CK1"]
 
 
 def test_adb_lost_after_opening_the_session_still_needs_reconciling(tmp_path):

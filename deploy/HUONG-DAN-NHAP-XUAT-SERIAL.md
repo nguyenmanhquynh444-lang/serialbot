@@ -249,6 +249,8 @@ Trạng thái `UNKNOWN` nghĩa là bot không xác nhận được (mất phản
 | Dừng vì app chỉ sang bin khác với ô **Mã bin** | Đơn trải nhiều vị trí | Để trống **Mã bin** nếu muốn đi theo app, hoặc kiểm tra lại đơn |
 | Dừng vì hộp thoại lạ | App hiện hộp thoại bot chưa biết | Xem ảnh chụp và thông báo; **không bấm bừa**. Gửi cho người phát hành |
 | Không thấy kết quả trong Excel | File đang mở trong Excel lúc chạy | Đóng file; nếu giao diện báo **Chưa lưu Excel**, đợi lượt chạy thoát hẳn rồi bấm **Lưu lại Excel**. Kết quả vẫn nằm an toàn trong nhật ký |
+| Thanh trạng thái báo *"ADB không phản hồi ... chờ 5s rồi thử lại (1/4)"* | Máy ảo nhận phím chậm, hay gặp ngay sau khi đóng một phiên | **Không cần làm gì.** Lúc này chưa mở phiên nào nên bot tự chờ (5s, 15s, 30s, 60s) rồi làm lại mã đó. Hết 4 lần vẫn hỏng thì bot dừng: kiểm tra LDPlayer rồi bấm **Start**, mã đó sẽ chạy lại từ đầu |
+| Dừng với *"ADB mất phản hồi giữa phiên"* hoặc *"ngay lúc bấm mở phiên"* | ADB hụt khi phiên đã (có thể đã) mở | Bot **không** tự thử lại vì phím gõ hụt có thể vẫn tới app trễ. Làm theo mục *Khi lượt chạy bị dừng giữa chừng* bên dưới |
 | Bấm **Stop** mà chưa thoát ngay | Bot chờ lệnh ADB đang chạy (tối đa khoảng 8 giây) và chờ lưu Excel xong | Đợi; đừng đóng cửa sổ khi bot còn đang dừng |
 | Bộ cài báo lỗi | App vẫn đang chạy (kể cả biểu tượng dưới khay hệ thống) | Đóng app rồi cài lại |
 | `Cap-nhat.bat` không tải được | Mạng hoặc antivirus chặn | Tải tay `SerialPasteBot-Setup.exe` từ trang Releases (xem hướng dẫn cài đặt) |

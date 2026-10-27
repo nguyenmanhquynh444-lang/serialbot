@@ -79,6 +79,10 @@ RID_DIALOG_NEGATIVE = "button2"
 
 DEFAULT_STEP_TIMEOUT = 15.0
 DEFAULT_SEARCH_TIMEOUT = 2.0
+# Nhịp chờ trước mỗi lần làm lại một mã khi ADB hụt lúc chưa mở phiên. Log máy
+# thật: lệnh `input` treo hết 8s ngay sau khi đóng phiên trước (app còn bận),
+# thường chạy lại sau ~15s là được, có lúc kéo dài gần 2 phút - nên giãn dần.
+DEFAULT_ADB_RETRY_DELAYS = (5.0, 15.0, 30.0, 60.0)
 # Một lần `uiautomator dump` mất ~1.46s trên máy thật, nên bản thân vòng lặp đã
 # tự giãn nhịp rồi - khoảng nghỉ thêm chỉ là thời gian chết cộng vào mỗi vòng.
 # 0.25s cũ làm mỗi mã OR mất thêm ~3s. Giữ lại một nhịp rất ngắn để không quay
@@ -116,6 +120,10 @@ class PickStopped(Exception):
         self.screenshot_path = screenshot_path
 
 
+class AdbLost(PickStopped):
+    """ADB không trả lời (hết giờ hoặc lỗi) - khác với app trả lời sai."""
+
+
 class OrNotFoundError(PickStopped):
     """
     Ngoại lệ duy nhất được phép "bỏ qua rồi chạy tiếp": gõ mã OR nhưng hết
@@ -148,6 +156,9 @@ class PickConfig:
     # chưa động gì tới kho.
     check_expected_count: bool = True
     capture_screenshot: bool = True
+    # ADB hụt trước khi bấm nút mở phiên thì chờ từng nhịp này rồi làm lại mã đó
+    # từ đầu - xem `_open_with_adb_retry`. Rỗng là tắt, dừng ngay như trước.
+    adb_retry_delays: tuple = DEFAULT_ADB_RETRY_DELAYS
 
 
 @dataclass
@@ -238,6 +249,9 @@ class PickRunner:
         self._scan_xml = ""
         self._counter_total = None
         self._completion_seen = False
+        # Đã gửi một lần chạm có thể đổi trạng thái app (nút mở phiên, xác nhận
+        # tạo phiên...). Từ lúc này ADB hụt là không được tự làm lại mã nữa.
+        self._app_touched = False
         self.journal = journal
         self.run_id = run_id
         self.session_mode = "pick"
@@ -330,10 +344,62 @@ class PickRunner:
             if attempt < 2:
                 self.retry_count += 1
                 self._poll(min(POLL_INTERVAL, max(0.0, deadline - time.monotonic())))
-        raise self._stop("Không đọc được màn hình máy ảo qua ADB sau 3 lần đọc.")
+        raise self._adb_lost("Không đọc được màn hình máy ảo qua ADB sau 3 lần đọc.")
 
     def _stop(self, message: str) -> "PickStopped":
         return PickStopped(message, self._screenshot())
+
+    def _adb_lost(self, message: str) -> "AdbLost":
+        return AdbLost(message, self._screenshot())
+
+    def _open_with_adb_retry(self, bill: str, open_session):
+        """
+        Chạy `open_session` (vào danh sách, gõ mã, bấm mở phiên); ADB hụt khi
+        chưa chạm nút nào đổi trạng thái app thì chờ rồi làm lại cả bước.
+
+        Làm lại được vì tới lúc đó bot mới chỉ gõ vào ô tìm kiếm - tra cứu, không
+        đổi gì trên kho. Lệnh gõ hụt vẫn có thể tới app trễ, nhưng lần gõ sau
+        xóa ô trước, và mọi lớp đối chiếu cũ (ô phải giữ đúng mã, lọc ra đúng
+        một thẻ) vẫn chặn trước khi bấm. Hụt ngay lúc bấm mở phiên thì phiên có
+        thể đã mở - không làm lại, dừng để người xem.
+        """
+        delays = tuple(self.config.adb_retry_delays or ())
+        for attempt in range(len(delays) + 1):
+            self._app_touched = False
+            try:
+                return open_session()
+            except (AdbUnavailableError, AdbLost) as exc:
+                reason = getattr(exc, "message", str(exc))
+                if self._app_touched:
+                    raise self._adb_lost(
+                        f"[{bill}] ADB mất phản hồi ngay lúc bấm mở phiên ({reason}) - "
+                        f"phiên trên app có thể đã mở. Kiểm tra trên app trước khi chạy lại."
+                    ) from exc
+                if self._should_stop():
+                    raise PickStopped("Người dùng bấm Dừng.") from exc
+                if attempt >= len(delays):
+                    raise self._adb_lost(
+                        f"[{bill}] ADB không phản hồi, đã thử lại {len(delays)} lần "
+                        f"vẫn không được ({reason}). Chưa mở phiên nào cho mã này - "
+                        f"kiểm tra LDPlayer rồi bấm Start để chạy tiếp."
+                    ) from exc
+                delay = delays[attempt]
+                self.retry_count += 1
+                self._log(
+                    f"[{bill}] ADB không phản hồi ({reason}) - chưa mở phiên, chờ "
+                    f"{delay:.0f}s rồi thử lại ({attempt + 1}/{len(delays)})"
+                )
+                self._backoff(delay)
+                # Kết luận màn hình của mã trước không còn đáng tin sau khi hụt.
+                self._at_search_xml = ""
+
+    def _backoff(self, seconds: float) -> None:
+        """Ngủ chờ ADB hồi lại, nhưng bấm Dừng là thoát ngay."""
+        until = time.monotonic() + seconds
+        while time.monotonic() < until:
+            if self._should_stop():
+                raise PickStopped("Người dùng bấm Dừng.")
+            time.sleep(min(0.2, max(0.0, until - time.monotonic())))
 
     def _not_found(self, message: str) -> "OrNotFoundError":
         return OrNotFoundError(message, self._screenshot())
@@ -433,9 +499,11 @@ class PickRunner:
         operation = self._begin_operation("tap", payload=payload)
         deadline = getattr(self, "_active_deadline", None) or time.monotonic() + self.config.step_timeout
         self._check_wait(deadline)
+        if not harmless:
+            self._app_touched = True
         with adb_budget(self.adb, deadline):
             if not self.screen.tap_node(node):
-                raise self._stop(f"Gửi lệnh chạm '{name}' thất bại.")
+                raise self._adb_lost(f"Gửi lệnh chạm '{name}' thất bại.")
         # Keep the intention pending until the whole bill is verified closed.
 
     def _type(self, text: str, xml: str = "", deadline=None) -> None:
@@ -501,8 +569,11 @@ class PickRunner:
         seconds_before = self.screen.dump_seconds
         self._log(f"[{bill}] mở màn hình tìm mã OR")
 
-        self._open_picking_list()
-        session_code = self._search_and_open(bill, len(rows))
+        def open_session():
+            self._open_picking_list()
+            return self._search_and_open(bill, len(rows))
+
+        session_code = self._open_with_adb_retry(bill, open_session)
         outcome.session_code = session_code
 
         # Mỗi bước trả màn hình cho bước sau: gõ và đọc màn hình đi chung một

@@ -27,6 +27,7 @@ from automation_backend import (
     LDPLAYER_DIR_ENV,
     AdbBackend,
     AdbClient,
+    AdbUnavailableError,
     find_ldplayer_tool,
 )
 from pick_runner import OrNotFoundError, PickConfig, PickRunner, PickStopped
@@ -196,6 +197,19 @@ class PickWorker(QThread):
             except PickStopped as e:
                 self._report_partial(bill, rows, ref)
                 self._emit_stopped(e.message, e.screenshot_path or "")
+                return
+            except AdbUnavailableError as e:
+                # Lọt tới đây nghĩa là phiên đã mở: hụt lúc chưa mở thì runner tự
+                # chờ và làm lại. Phím gõ hụt có thể vẫn tới app trễ, nên không
+                # tự gõ lại - báo rõ để người kiểm tra phiên đang dở.
+                logger.warning("Pick run: ADB lost inside the session of '%s': %s", bill, e)
+                self._report_partial(bill, rows, ref)
+                self._emit_stopped(
+                    f"ADB mất phản hồi giữa phiên của mã '{bill}' ({e}).\n\n"
+                    "Phiên trên app có thể đang dở: kiểm tra và hoàn tất/đóng phiên "
+                    "trên app rồi bấm Start để chạy tiếp.",
+                    "",
+                )
                 return
             except Exception as e:                       # noqa: BLE001
                 logger.exception("Pick run crashed on '%s'", bill)

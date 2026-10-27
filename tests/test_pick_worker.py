@@ -166,6 +166,39 @@ def test_partial_serials_are_reported_when_a_bill_breaks(qapp):
     assert events["results"][0]["message"] == "Đã xuất trước khi dừng"
 
 
+def test_adb_lost_inside_a_session_stops_with_a_clear_message(qapp):
+    """Phiên đã mở mà ADB hụt: không tự gõ lại, nói rõ là phiên có thể đang dở."""
+    device = FakePickDevice([Session("VD1", "PL_001", 1), Session("VD2", "PL_002", 1)])
+    original = device.run_shell
+    device.run_shell = lambda c, timeout=None: (
+        None if device.state == "tote" and "input text" in c else original(c, timeout))
+    worker = make_worker(device, groups(("VD1", ["S1"]), ("VD2", ["S2"])))
+
+    events = collect(worker)
+
+    assert len(events["stopped"]) == 1
+    assert "giữa phiên của mã 'VD1'" in events["stopped"][0][0]
+    assert "không lường trước" not in events["stopped"][0][0]
+    assert events["bills"] == []
+
+
+def test_adb_lost_before_opening_a_session_is_retried_by_the_worker_run(qapp):
+    device = FakePickDevice([Session("VD1", "PL_001", 1)])
+    original, left = device.run_shell, [1]
+    def flaky(command, timeout=None):
+        if device.state == "list" and "input text" in command and left[0]:
+            left[0] -= 1
+            return None
+        return original(command, timeout)
+    device.run_shell = flaky
+    worker = make_worker(device, groups(("VD1", ["S1"])), adb_retry_delays=(0,))
+
+    events = collect(worker)
+
+    assert events["stopped"] == []
+    assert [b["bill"] for b in events["bills"]] == ["VD1"]
+
+
 def test_stop_button_ends_the_run(qapp):
     device = FakePickDevice([Session("VD1", "PL_001", 1), Session("VD2", "PL_002", 1)])
     worker = make_worker(device, groups(("VD1", ["S1"]), ("VD2", ["S2"])))
