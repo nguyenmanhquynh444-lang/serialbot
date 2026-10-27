@@ -81,6 +81,10 @@ class FakePickDevice:
                       "new_clickable_parent" (chữ nút nằm trong ô con không bấm được
                       của một ô cha bấm được - tuỳ máy báo `clickable` ở đâu)
     finish_after    - app đóng phiên sau chừng này serial dù chưa đủ số lượng
+    empty_text      - app hiện chữ "Không tìm thấy kết quả" khi lọc ra rỗng. App
+                      thật KHÔNG hiện chữ nào (log 23/10: chỉ còn khung danh sách
+                      trống) nên mặc định tắt; bật để kiểm nhánh chốt nhanh cho
+                      app có chữ báo rỗng.
     """
 
     def __init__(
@@ -92,6 +96,7 @@ class FakePickDevice:
         totes_needed=1,
         finish_layout="legacy",
         finish_after=0,
+        empty_text=False,
     ):
         self.sessions = list(sessions)
         self.reject_serials = set(reject_serials)
@@ -100,6 +105,7 @@ class FakePickDevice:
         self.totes_needed = totes_needed
         self.finish_layout = finish_layout
         self.finish_after = finish_after
+        self.empty_text = empty_text
         self.history_opened = False
 
         self.state = "menu"
@@ -138,8 +144,8 @@ class FakePickDevice:
                     _node("btnProceed", "Lấy hàng", (20, top + 100, 700, top + 150), True,
                           "android.widget.Button"),
                 ]
-            if self.filter_text and not any(not s.done and self.filter_text.lower() in s.or_code.lower()
-                                            for s in self.sessions):
+            if self.empty_text and self.filter_text and not any(
+                    not s.done and self.filter_text.lower() in s.or_code.lower() for s in self.sessions):
                 nodes.append(_node("emptyResult", "Không tìm thấy kết quả"))
             return _screen(nodes)
 

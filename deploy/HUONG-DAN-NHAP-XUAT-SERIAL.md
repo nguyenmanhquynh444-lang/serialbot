@@ -244,16 +244,35 @@ Trạng thái `UNKNOWN` nghĩa là bot không xác nhận được (mất phản
 |---|---|---|
 | Bấm **Refresh** mà danh sách trống | LDPlayer chưa bật hẳn, hoặc ADB chưa thấy máy | Bật LDPlayer tới màn hình Android; PowerShell gõ `adb devices` phải thấy một dòng `device` |
 | Bot báo thiếu `adb.exe` | LDPlayer cài ở chỗ lạ | `setx LDPLAYER_DIR "D:\Duong\Dan\LDPlayer9"` rồi **mở lại bot**. Hai chế độ này chỉ chạy qua ADB, không có đường lui gõ bàn phím |
-| Dừng với lý do lọc ra 0 hoặc nhiều hơn 1 thẻ | Mã sai, mã mơ hồ khớp nhiều phiên, hoặc phiên đã xong từ trước | Kiểm tra mã trên app. Bot không bấm thẻ nào khi chưa chắc |
+| Dừng vì mã lọc ra nhiều hơn 1 thẻ, hoặc báo *"chưa xác nhận truy vấn đã hoàn tất"* | Mã mơ hồ khớp nhiều phiên; hoặc danh sách còn đang tải, ô tìm kiếm chưa giữ đúng mã, nên bot không dám kết luận | Kiểm tra mã trên app. Bot không bấm thẻ nào khi chưa chắc. Bản **2.2.0 đến 2.2.3** còn dừng nhầm ở **mọi** mã không có trong danh sách, xem mục *Mã OR không có trong danh sách* bên dưới |
+| Dòng `ERROR` *"Không tìm thấy mã OR ..."* trong Excel, bot vẫn chạy tiếp | Mã không có trong danh sách Lấy hàng: đã lấy xong, gõ sai, hoặc chưa được phân công | Bình thường, bot chỉ ghi lỗi mã đó rồi sang mã sau. Gõ tay mã đó vào app để chắc, cần thì chạy lại riêng mã đó |
 | Dừng vì lệch số lượng | Số sản phẩm app báo khác số serial trong Excel | Kiểm tra file; lúc này chưa quét serial nào nên chưa mất gì |
 | Dừng vì app chỉ sang bin khác với ô **Mã bin** | Đơn trải nhiều vị trí | Để trống **Mã bin** nếu muốn đi theo app, hoặc kiểm tra lại đơn |
 | Dừng vì hộp thoại lạ | App hiện hộp thoại bot chưa biết | Xem ảnh chụp và thông báo; **không bấm bừa**. Gửi cho người phát hành |
-| Không thấy kết quả trong Excel | File đang mở trong Excel lúc chạy | Đóng file; nếu giao diện báo **Chưa lưu Excel**, đợi lượt chạy thoát hẳn rồi bấm **Lưu lại Excel**. Kết quả vẫn nằm an toàn trong nhật ký |
+| Không thấy kết quả trong Excel; thanh trạng thái báo **Chưa lưu Excel: [WinError 5] Access is denied** | File đang mở trong Excel lúc chạy, hoặc OneDrive đang khóa file (file nằm trong thư mục Desktop/Documents được OneDrive đồng bộ) | Đóng file trong Excel, để OneDrive đồng bộ xong hoặc chép file ra thư mục ngoài OneDrive rồi chạy. Lỗi này **không làm bot dừng**; nếu giao diện báo **Chưa lưu Excel**, đợi lượt chạy thoát hẳn rồi bấm **Lưu lại Excel**. Kết quả vẫn nằm an toàn trong nhật ký |
 | Thanh trạng thái báo *"ADB không phản hồi ... chờ 5s rồi thử lại (1/4)"* | Máy ảo nhận phím chậm, hay gặp ngay sau khi đóng một phiên | **Không cần làm gì.** Lúc này chưa mở phiên nào nên bot tự chờ (5s, 15s, 30s, 60s) rồi làm lại mã đó. Hết 4 lần vẫn hỏng thì bot dừng: kiểm tra LDPlayer rồi bấm **Start**, mã đó sẽ chạy lại từ đầu |
 | Dừng với *"ADB mất phản hồi giữa phiên"* hoặc *"ngay lúc bấm mở phiên"* | ADB hụt khi phiên đã (có thể đã) mở | Bot **không** tự thử lại vì phím gõ hụt có thể vẫn tới app trễ. Làm theo mục *Khi lượt chạy bị dừng giữa chừng* bên dưới |
 | Bấm **Stop** mà chưa thoát ngay | Bot chờ lệnh ADB đang chạy (tối đa khoảng 8 giây) và chờ lưu Excel xong | Đợi; đừng đóng cửa sổ khi bot còn đang dừng |
 | Bộ cài báo lỗi | App vẫn đang chạy (kể cả biểu tượng dưới khay hệ thống) | Đóng app rồi cài lại |
 | `Cap-nhat.bat` không tải được | Mạng hoặc antivirus chặn | Tải tay `SerialPasteBot-Setup.exe` từ trang Releases (xem hướng dẫn cài đặt) |
+
+### Mã OR không có trong danh sách
+
+Mã không có trong danh sách Lấy hàng là chuyện thường trong file. Lúc này bot chưa mở phiên nào, nên **không dừng**: nó ghi `ERROR` cho các dòng của mã đó rồi gõ mã kế tiếp.
+
+Bot chỉ kết luận "không có" khi có bằng chứng danh sách đã trống thật:
+
+- Ô tìm kiếm đã giữ đúng mã vừa gõ, không còn thẻ phiên nào trên màn hình và app không đang tải.
+- Danh sách vẫn trống qua **3 lần đọc màn hình liên tiếp**, kéo dài ít nhất **2 giây**. Một lần đọc trống đơn lẻ không đủ, vì app lọc bất đồng bộ.
+- Nếu app có hiện chữ báo rỗng mới thì bot chốt ngay, không chờ.
+
+Còn mơ hồ thì vẫn dừng, không đoán: danh sách đang tải, ô chưa nhận đủ mã, hoặc có thẻ phiên mà không có nút *Lấy hàng*.
+
+**Lỗi đã sửa (ghi nhận ngày 27/10 ở bản 2.2.3, đã sửa ở 2.2.4):** hộp thoại *"Không tìm thấy mã OR '...' nhưng chưa xác nhận truy vấn đã hoàn tất"*, dòng *Màn hình đang hiện* chỉ có `textInput='<mã>'` và `rclSessionList`, ảnh LDPlayer lúc dừng là danh sách trống.
+
+- **Nguyên nhân:** bản 2.2.0 đến 2.2.3 chỉ coi mã là không có khi app hiện chữ báo rỗng. App kho thật **không hiện chữ nào** khi lọc ra rỗng, nên điều kiện không bao giờ đúng. Bot chờ hết 15 giây rồi dừng cả lượt ở mã không có đầu tiên. Gặp ngày 23/10 (ba lần) và 27/10. Hai lần dừng ngày 20/10 và 21/10 cùng thông báo nhưng app lúc đó đang ở màn hình một phiên dở, không phải danh sách trống, nên dừng đúng. Trước 2.2.0 không bị, mã không có được bỏ qua sau khoảng 2 giây.
+- **Vì sao test không bắt được:** máy ảo giả trong test tự thêm chữ *"Không tìm thấy kết quả"* mà app thật không có. Nay máy ảo giả mặc định không có chữ đó và có test dựng đúng màn hình thật.
+- **Rủi ro còn lại:** app lọc chậm hơn cửa sổ chờ (khoảng 3 giây) thì mã có thật bị ghi nhầm *không tìm thấy*. Thấy mã có thật mà bị ghi lỗi này thì chạy lại riêng mã đó và báo người phát hành để tăng thời gian chờ.
 
 ### Khi lượt chạy bị dừng giữa chừng
 

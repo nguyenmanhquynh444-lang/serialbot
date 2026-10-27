@@ -123,7 +123,7 @@ Các ô không dùng ở chế độ này bị **khóa kèm tooltip** (chứ kh�
 ### Bot làm gì trong một mã OR
 
 1. **Về màn hình tìm mã OR.** Đang ở menu chính thì bấm *Lấy hàng* (`btnPick`); đang đứng sẵn ở màn hình tìm thì dùng luôn — từ mã thứ hai trở đi luôn là trường hợp này.
-2. **Tìm mã OR** — xóa ô rồi gõ mã, chờ danh sách lọc xong. Chỉ bấm vào khi lọc ra **đúng một** thẻ; ra 0 hay 2+ thẻ là dừng, không dám đoán.
+2. **Tìm mã OR** — xóa ô rồi gõ mã, chờ danh sách lọc xong. Chỉ bấm vào khi lọc ra **đúng một** thẻ. Ra 2+ thẻ là dừng, không dám đoán. Ra 0 thẻ **và** danh sách trống ổn định (ô đã giữ đúng mã, không vòng tải, trống qua 3 lần đọc liên tiếp trong ít nhất 2s) thì mã đó không có thật: ghi lỗi cho mã rồi sang mã sau, vì chưa mở phiên nào nên bỏ qua an toàn. Còn đang tải hay chưa chắc thì vẫn dừng. App kho thật không hiện chữ báo rỗng, nên bằng chứng là danh sách trống ổn định chứ không phải một dòng chữ - xem [Mã OR không có trong danh sách](deploy/HUONG-DAN-NHAP-XUAT-SERIAL.md#mã-or-không-có-trong-danh-sách).
 3. **Đối chiếu số lượng** (nếu bật) rồi mới bấm *Lấy hàng* trên thẻ.
 4. **Đóng hộp "Picking assistant"** nếu app hiện — hộp chọn ngôn ngữ. Bot bấm nút nghịch của AlertDialog (`button2`) chứ không khớp chữ "Skip", vì màn hình quét serial cũng có nút tên Skip nhưng nó là "bỏ qua sản phẩm này". Hộp thoại **lạ** thì dừng, không bấm bừa.
 5. **Quét thiết bị chứa hàng (tote)** — trừ khi số đếm *"Số lượng thiết bị chứa hàng cần DK"* đã đủ; app nhớ tote giữa các phiên nên từ mã thứ hai màn hình này thường chỉ lướt qua, gõ thêm là đăng ký chồng một thiết bị nữa.

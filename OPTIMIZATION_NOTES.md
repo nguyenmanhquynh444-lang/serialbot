@@ -42,7 +42,7 @@ UI và báo cáo tách **Đã xác nhận** với **Không phát hiện lỗi**.
 - Parse XML một lần mỗi snapshot qua cache giới hạn; các lần tra node không parse lại XML.
 - Chỉ bỏ xóa khi snapshot chưa có thao tác xen giữa xác nhận đúng ô nhập trống. Ô tìm OR còn mã cũ vẫn xóa.
 - Dùng lại màn hình quét/kết thúc/search, gồm check-in; không bật compressed hoặc ghép sleep trước dump.
-- OR chuyển bin trước serial tiếp theo khi app yêu cầu. Tìm kiếm phân biệt đang tải, kết quả cũ, kết quả ổn định và kết quả rỗng có bằng chứng mới. Danh sách rỗng còn từ truy vấn cũ dẫn tới dừng chưa xác định.
+- OR chuyển bin trước serial tiếp theo khi app yêu cầu. Tìm kiếm phân biệt đang tải, kết quả cũ, kết quả ổn định và kết quả rỗng có bằng chứng. Bằng chứng rỗng có hai dạng: chữ báo rỗng mới so với màn hình trước khi gõ, hoặc trống ổn định (ô giữ đúng mã, không thẻ, không vòng tải, trống qua `empty_confirm_reads` lần đọc liên tiếp trong ít nhất `search_timeout`). App kho thật không hiện chữ báo rỗng nên dạng thứ hai là dạng duy nhất xảy ra ngoài đời; bản 2.2.0 đến 2.2.3 chỉ nhận dạng đầu nên mọi mã không có đều dừng cả lượt (log 23/10, ảnh máy kho 27/10). Máy ảo giả trong test mặc định không còn phần tử báo rỗng. Danh sách đang tải, ô chưa giữ đúng mã hoặc còn thẻ phiên vẫn dẫn tới dừng chưa xác định.
 - Profile được khóa khi đọc/ghi giữa các thread và tiến trình, file tạm có tên riêng. Preview chặn cặp tiêu đề MaOR/Serial.
 
 So sánh runner trước sửa (Git HEAD lúc triển khai) và runner hiện tại bằng thiết bị giả, có hai thẻ OR ban đầu:

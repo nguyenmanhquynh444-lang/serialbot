@@ -16,12 +16,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pytest
 
 from automation_backend import AdbBackend
-from fake_pick_device import FakePickDevice, Session
+from fake_pick_device import FakePickDevice, Session, _node, _screen
 from pick_runner import OrNotFoundError, PickConfig, PickRunner, PickStopped, parse_counter
 
 
 def make_runner(device, **config_kwargs):
     config_kwargs.setdefault("step_timeout", 2.0)
+    # Thiết bị giả trả lời tức thì nên cửa sổ "trống ổn định" 2s mặc định sẽ
+    # trùng đúng hạn của bước (2s). Rút ngắn để test không chạy đua với hạn.
+    config_kwargs.setdefault("search_timeout", 0.3)
     config_kwargs.setdefault("capture_screenshot", False)
     config = PickConfig(**config_kwargs)
     return PickRunner(device, AdbBackend(device), config, on_log=None)
@@ -300,15 +303,107 @@ def test_missing_bill_is_decided_in_about_two_seconds_not_the_full_timeout():
     `step_timeout` cho mỗi mã như vậy thì 300 mã mất cả tiếng chỉ để đứng nhìn.
     """
     device = FakePickDevice([Session("VD1", "PL_001", 1)])
-    runner = make_runner(device, step_timeout=15.0)
+    runner = make_runner(device, step_timeout=15.0, search_timeout=2.0)
 
     started = time.monotonic()
     with pytest.raises(OrNotFoundError):
         runner.run_bill("VD-KHONG-CO", rows("S1"))
     elapsed = time.monotonic() - started
 
-    assert elapsed < 6.0, f"mất {elapsed:.1f}s - đáng lẽ chốt quanh search_timeout"
+    assert 2.0 <= elapsed < 6.0, f"mất {elapsed:.1f}s - đáng lẽ chốt quanh search_timeout"
     assert device.state == "list"           # chưa mở phiên nào
+
+
+def test_missing_bill_is_concluded_at_once_when_the_app_shows_an_empty_message():
+    """Nhánh nhanh cho app có hiện chữ báo rỗng mới - chốt ngay, không chờ cửa sổ."""
+    device = FakePickDevice([Session("VD1", "PL_001", 1)], empty_text=True)
+    runner = make_runner(device, step_timeout=15.0, search_timeout=10.0)
+
+    started = time.monotonic()
+    with pytest.raises(OrNotFoundError, match="app đã trả kết quả rỗng"):
+        runner.run_bill("VD-KHONG-CO", rows("S1"))
+
+    assert time.monotonic() - started < 3.0
+
+
+def _real_search_screen(typed, extra=()):
+    """Màn hình tìm mã OR đúng như log máy kho thật: danh sách trống, không chữ nào."""
+    return _screen([
+        _node("action_bar_root", "", (0, 0, 720, 1280)),
+        _node("toolbar", "", (0, 0, 720, 100)),
+        _node("tvTitle", "Lấy hàng", (200, 20, 500, 80)),
+        _node("icRefresh", "", (640, 20, 700, 80), True, "android.widget.ImageView"),
+        _node("textInputLO", "", (0, 120, 720, 200)),
+        _node("textInput", typed, (0, 120, 720, 200), True, "android.widget.EditText"),
+        _node("rclSessionList", "", (0, 220, 720, 1200), False, "androidx.recyclerview.widget.RecyclerView"),
+        *extra,
+    ])
+
+
+def test_real_app_empty_list_without_any_message_is_a_missing_bill():
+    """
+    Chính màn hình làm bot dừng ngày 27/10 (bản 2.2.3): ô giữ đúng mã, khung danh
+    sách trống, không có chữ báo rỗng. Bản cũ đòi chữ đó nên dừng cả lượt; nay
+    trống ổn định thì ghi "không tìm thấy" và đi tiếp - mà chưa chạm gì vào app.
+    """
+    device = FakePickDevice([])
+    device.state = "list"
+    device._xml = lambda: _real_search_screen("ORVIN340UM80465")
+
+    with pytest.raises(OrNotFoundError, match="danh sách vẫn trống") as caught:
+        make_runner(device).run_bill("ORVIN340UM80465", rows("S1"))
+
+    assert type(caught.value) is OrNotFoundError
+    assert not any("input tap" in command for command in device.commands)
+
+
+def test_empty_streak_needs_both_enough_reads_and_enough_time():
+    """Trống chỉ vài lần đọc liền sát nhau thì chưa phải bằng chứng - phải đủ cả thời gian."""
+    device = FakePickDevice([])
+    device.state = "list"
+    device._xml = lambda: _real_search_screen("OR1")
+
+    with pytest.raises(PickStopped) as caught:
+        make_runner(device, step_timeout=0.6, search_timeout=5.0).run_bill("OR1", rows("S1"))
+
+    assert type(caught.value) is PickStopped          # không phải OrNotFoundError
+
+
+def test_a_card_without_a_proceed_button_is_not_an_empty_list():
+    """Thẻ phiên ở trạng thái khác (không có nút Lấy hàng) vẫn là danh sách có dữ liệu."""
+    device = FakePickDevice([])
+    device.state = "list"
+    device._xml = lambda: _real_search_screen(
+        "OR1", extra=[_node("tvSessionCode", "PL_001", (20, 240, 600, 270))])
+
+    with pytest.raises(PickStopped) as caught:
+        make_runner(device, step_timeout=0.8).run_bill("OR1", rows("S1"))
+
+    assert type(caught.value) is PickStopped
+
+
+def test_a_loading_list_never_counts_toward_the_empty_streak():
+    device = FakePickDevice([])
+    device.state = "list"
+    device._xml = lambda: _real_search_screen(
+        "OR1", extra=[_node("tvLoading", "Vui lòng đợi", (200, 600, 500, 650))])
+
+    with pytest.raises(PickStopped) as caught:
+        make_runner(device, step_timeout=0.8).run_bill("OR1", rows("S1"))
+
+    assert type(caught.value) is PickStopped
+
+
+def test_the_empty_streak_restarts_when_the_field_does_not_hold_the_code():
+    """Ô chưa nhận đủ mã thì danh sách trống là do app chậm, không tính vào chuỗi."""
+    device = FakePickDevice([])
+    device.state = "list"
+    device._xml = lambda: _real_search_screen("OR")        # bot gõ OR1 nhưng ô mới có "OR"
+
+    with pytest.raises(PickStopped) as caught:
+        make_runner(device, step_timeout=0.8).run_bill("OR1", rows("S1"))
+
+    assert type(caught.value) is PickStopped
 
 
 def test_a_slow_list_is_not_mistaken_for_a_missing_bill():

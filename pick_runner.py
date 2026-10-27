@@ -79,6 +79,7 @@ RID_DIALOG_NEGATIVE = "button2"
 
 DEFAULT_STEP_TIMEOUT = 15.0
 DEFAULT_SEARCH_TIMEOUT = 2.0
+DEFAULT_EMPTY_CONFIRM_READS = 3
 # Nhịp chờ trước mỗi lần làm lại một mã khi ADB hụt lúc chưa mở phiên. Log máy
 # thật: lệnh `input` treo hết 8s ngay sau khi đóng phiên trước (app còn bận),
 # thường chạy lại sau ~15s là được, có lúc kéo dài gần 2 phút - nên giãn dần.
@@ -126,8 +127,9 @@ class AdbLost(PickStopped):
 
 class OrNotFoundError(PickStopped):
     """
-    Ngoại lệ duy nhất được phép "bỏ qua rồi chạy tiếp": gõ mã OR nhưng hết
-    step_timeout mà danh sách Lấy hàng không lọc ra thẻ nào.
+    Ngoại lệ duy nhất được phép "bỏ qua rồi chạy tiếp": gõ mã OR mà danh sách
+    Lấy hàng không lọc ra thẻ nào và đã trống ổn định đủ lâu (xem
+    `PickRunner._track_empty`) - hoặc app tự hiện chữ báo rỗng.
 
     An toàn để bỏ qua vì thời điểm này bot chưa mở phiên - màn hình vẫn đang là
     "Tìm theo mã OR", chưa động gì tới kho. Bên gọi (PickWorker) bắt riêng lỗi
@@ -151,6 +153,13 @@ class PickConfig:
     # hết `step_timeout` cho mỗi mã như vậy thì 300 mã mất cả tiếng đồng hồ chỉ
     # để đứng nhìn. Chờ chừng này rồi ghi lỗi và sang mã sau.
     search_timeout: float = DEFAULT_SEARCH_TIMEOUT
+    # App kho thật KHÔNG hiện chữ nào khi danh sách lọc ra rỗng (chỉ còn khung
+    # rclSessionList trống - xem log 23/10 và 27/10). Nên "mã không có" chỉ chốt
+    # được bằng cách nhìn danh sách trống ổn định: ô đã giữ đúng mã, không thẻ,
+    # không vòng tải, và trống qua chừng này lần đọc liên tiếp, kéo dài tối thiểu
+    # `search_timeout`. Một lần đọc trống đơn lẻ không chứng minh được gì vì lọc
+    # là bất đồng bộ.
+    empty_confirm_reads: int = DEFAULT_EMPTY_CONFIRM_READS
     # Bỏ qua bước đối chiếu số lượng app báo với số serial trong Excel. Mặc định
     # là bật vì lệch số nghĩa là file sai, mà phát hiện trước khi mở phiên thì
     # chưa động gì tới kho.
@@ -252,6 +261,10 @@ class PickRunner:
         # Đã gửi một lần chạm có thể đổi trạng thái app (nút mở phiên, xác nhận
         # tạo phiên...). Từ lúc này ADB hụt là không được tự làm lại mã nữa.
         self._app_touched = False
+        # Chuỗi lần đọc liên tiếp thấy danh sách trống - xem `_track_empty`.
+        self._empty_since = None
+        self._empty_last = 0.0
+        self._empty_reads = 0
         self.journal = journal
         self.run_id = run_id
         self.session_mode = "pick"
@@ -279,8 +292,9 @@ class PickRunner:
                                f"Không tìm thấy phiếu check-in '{args[0]}'.")
                 elif typed and typed != wanted:
                     message = f"Ô tìm kiếm đang là '{typed}' chứ không phải '{args[0]}' - không dám bấm."
-                elif not cards and typed == wanted and self._fresh_empty_result(xml) and not self._search_loading(xml):
-                    raise self._not_found(f"Không tìm thấy mã OR '{args[0]}' (app đã trả kết quả rỗng).")
+                elif not cards and typed == wanted and not self._search_loading(xml) and (
+                        self._fresh_empty_result(xml) or self._empty_confirmed()):
+                    raise self._not_found(self._empty_message(args[0]))
                 elif cards:
                     message = f"Mã OR '{args[0]}' lọc ra {len(cards)} phiên chưa xác minh đúng mã - không dám bấm."
                 else:
@@ -681,6 +695,13 @@ class PickRunner:
         thật; còn ô chưa kịp cập nhật thì trống là do app đang chậm, kết luận
         lúc đó sẽ bỏ sót một đơn có thật.
 
+        Bằng chứng "đã trống thật" có hai dạng. Nếu app hiện chữ báo rỗng mới
+        (so với màn hình trước khi gõ) thì chốt ngay. App kho thật thì không hiện
+        chữ nào - danh sách chỉ trống - nên dạng còn lại là trống ổn định qua
+        `empty_confirm_reads` lần đọc liên tiếp trong tối thiểu `search_timeout`
+        (`_track_empty`). Bản 2.2.0-2.2.3 chỉ chấp nhận dạng đầu, mà dạng đầu
+        không bao giờ xảy ra trên app thật, nên mọi mã không có đều dừng cả lượt.
+
         Ô giữ nguyên mã của lần trước thì gõ lại **một** lần: chạm vào ô cho nó
         nhận lại focus rồi gõ. Quan sát trên máy thật - sau vài mã không tìm
         thấy liên tiếp, `input text` không vào được ô nữa (ô còn nguyên mã cũ)
@@ -700,6 +721,8 @@ class PickRunner:
         retried = False
         candidate = None
         wanted = normalize_match_text(bill)
+        self._empty_since = None
+        self._empty_reads = 0
         while True:
             xml = self._dump(deadline)
             cards = nodes_with_id(xml, RID_PROCEED)
@@ -719,9 +742,12 @@ class PickRunner:
             else:
                 candidate = None
 
+            empty_confirmed = self._track_empty(xml, wanted)
             if not cards and typed == wanted and not loading and self._fresh_empty_result(xml):
-                # A stale empty list from the previous query proves nothing.
+                # Chữ báo rỗng còn sót từ truy vấn trước thì không chứng minh gì.
                 raise self._not_found(f"Không tìm thấy mã OR '{bill}' (app đã trả kết quả rỗng).")
+            if empty_confirmed:
+                raise self._not_found(self._empty_message(bill))
 
             # Ô đang giữ một mã khác hẳn: chữ bot gửi không vào được ô. Đợi cho
             # chắc (app có thể đang vẽ dở) rồi chạm vào ô và gõ lại một lần.
@@ -784,6 +810,53 @@ class PickRunner:
         self._log(f"[{bill}] vào phiên {session_code}")
         self._tap_id(xml, RID_PROCEED)
         return session_code
+
+    def _track_empty(self, xml: str, wanted: str) -> bool:
+        """
+        Ghi nhận một lần đọc màn hình và cho biết danh sách đã trống ổn định chưa.
+
+        Chuỗi đếm chỉ tiếp tục khi lần đọc này thỏa HẾT: đang ở màn hình tìm mã
+        OR, ô tìm kiếm đã giữ đúng mã vừa gõ, không còn thẻ nào trên màn hình
+        (kể cả thẻ không có nút Lấy hàng - app có thể hiện thẻ phiên ở trạng thái
+        khác, thấy thẻ là danh sách không rỗng) và app không đang tải. Một lần
+        đọc lệch bất kỳ là đếm lại từ đầu, nên danh sách chậm hiện thẻ muộn hơn
+        chuỗi đang đếm vẫn không bị bỏ sót.
+        """
+        empty_now = (
+            self._is_search_screen(xml)
+            and self._search_field_text(xml) == wanted
+            and not nodes_with_id(xml, RID_PROCEED)
+            and not nodes_with_id(xml, RID_SESSION_CODE)
+            and not self._search_loading(xml)
+        )
+        if not empty_now:
+            self._empty_since = None
+            self._empty_reads = 0
+            return False
+        now = time.monotonic()
+        if self._empty_since is None:
+            self._empty_since = now
+            self._empty_reads = 0
+        self._empty_last = now
+        self._empty_reads += 1
+        return self._empty_confirmed()
+
+    def _empty_confirmed(self) -> bool:
+        return (
+            self._empty_since is not None
+            and self._empty_reads >= self.config.empty_confirm_reads
+            and self._empty_last - self._empty_since >= self.config.search_timeout
+        )
+
+    def _empty_message(self, bill: str) -> str:
+        if self._empty_confirmed():
+            return (
+                f"Không tìm thấy mã OR '{bill}' trong danh sách Lấy hàng "
+                f"(ô tìm kiếm đã nhận đủ mã, danh sách vẫn trống qua "
+                f"{self._empty_reads} lần đọc liên tiếp trong "
+                f"{self._empty_last - self._empty_since:.1f}s)."
+            )
+        return f"Không tìm thấy mã OR '{bill}' (app đã trả kết quả rỗng)."
 
     @staticmethod
     def _search_loading(xml):

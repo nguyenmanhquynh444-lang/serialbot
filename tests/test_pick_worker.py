@@ -35,6 +35,9 @@ def groups(*specs):
 
 
 def make_worker(device, group_list, **config_kwargs):
+    # Thiết bị giả trả lời tức thì nên rút cửa sổ "trống ổn định" để không chạy
+    # đua với hạn 2s của bước.
+    config_kwargs.setdefault("search_timeout", 0.3)
     config = PickConfig(step_timeout=2.0, capture_screenshot=False, **config_kwargs)
     worker = PickWorker(group_list, "LDPlayer", config)
     worker.adb_client = device
